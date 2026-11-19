@@ -1,10 +1,12 @@
 import "dotenv/config";
 import express from "express";
 import cors from "cors";
-import { MongoClient } from "mongodb";
+import { MongoClient, ObjectId } from "mongodb";
+import { toNodeHandler, fromNodeHeaders } from "better-auth/node";
+
 import { betterAuth } from "better-auth";
 import { mongodbAdapter } from "@better-auth/mongo-adapter";
-import { toNodeHandler } from "better-auth/node";
+
 import { createAuthMiddleware, APIError } from "better-auth/api";
 
 // --------------------------------------------------
@@ -108,6 +110,42 @@ async function startServer() {
                     defaultValue: false,
                     input: false,
                 },
+                roleSelectionPending: {
+                    type: "boolean",
+                    required: false,
+                    defaultValue: false,
+                    input: false,
+                },
+            },
+        },
+        databaseHooks: {
+            user: {
+                create: {
+                    before: async (user, ctx) => {
+                        const path = ctx?.path || "";
+
+                        const isSocialRegistration =
+                            path.startsWith("/callback/") ||
+                            path === "/sign-in/social";
+
+                        if (!isSocialRegistration) {
+                            return {
+                                data: {
+                                    ...user,
+                                    roleSelectionPending: false,
+                                },
+                            };
+                        }
+
+                        return {
+                            data: {
+                                ...user,
+                                role: "customer",
+                                roleSelectionPending: true,
+                            },
+                        };
+                    },
+                },
             },
         },
 
@@ -183,6 +221,166 @@ async function startServer() {
 
     // JSON parsing for your existing menu routes.
     app.use(express.json({ limit: "100kb" }));
+
+    const usersCollection = db.collection("users");
+
+    // Verify the session and read the latest account from MongoDB.
+    async function requireAccount(req, res, next) {
+        try {
+            const session = await auth.api.getSession({
+                headers: fromNodeHeaders(req.headers),
+            });
+
+            if (!session?.user) {
+                return res.status(401).json({
+                    success: false,
+                    message: "Please sign in first.",
+                });
+            }
+
+            const userId = session.user.id;
+
+            const databaseId = ObjectId.isValid(userId)
+                ? new ObjectId(userId)
+                : userId;
+
+            const user = await usersCollection.findOne({
+                _id: databaseId,
+            });
+
+            if (!user) {
+                return res.status(401).json({
+                    success: false,
+                    message: "Account not found. Please sign in again.",
+                });
+            }
+
+            if (user.isBlocked === true) {
+                return res.status(403).json({
+                    success: false,
+                    message: "Your account is blocked.",
+                });
+            }
+
+            req.account = user;
+            next();
+        } catch (error) {
+            next(error);
+        }
+    }
+
+    // Read the current role and whether selection is still required.
+    app.get("/api/onboarding", requireAccount, (req, res) => {
+        res.set("Cache-Control", "no-store");
+
+        res.json({
+            success: true,
+            data: {
+                name: req.account.name,
+                role: req.account.role,
+                roleSelectionPending:
+                    req.account.roleSelectionPending === true,
+            },
+        });
+    });
+    function requireRole(...allowedRoles) {
+  return (req, res, next) => {
+    const account = req.account;
+
+    if (!account) {
+      return res.status(401).json({
+        success: false,
+        message: "Please sign in first.",
+      });
+    }
+
+    if (account.isBlocked === true) {
+      return res.status(403).json({
+        success: false,
+        message: "Your account is blocked.",
+      });
+    }
+
+    if (account.roleSelectionPending === true) {
+      return res.status(403).json({
+        success: false,
+        message: "Complete your account role selection first.",
+      });
+    }
+
+    if (!allowedRoles.includes(account.role)) {
+      return res.status(403).json({
+        success: false,
+        message: "You do not have permission to perform this action.",
+      });
+    }
+
+    next();
+  };
+}
+
+    // Save a role once. Never accept a user ID from the browser.
+    app.post("/api/onboarding/role", requireAccount, async (req, res, next) => {
+        try {
+            // Protect this cookie-authenticated write against other origins.
+            if (req.get("origin") !== new URL(clientUrl).origin) {
+                return res.status(403).json({
+                    success: false,
+                    message: "Request origin is not allowed.",
+                });
+            }
+
+            if (!req.is("application/json")) {
+                return res.status(415).json({
+                    success: false,
+                    message: "Send the request as JSON.",
+                });
+            }
+
+            const role = req.body?.role;
+
+            if (role !== "customer" && role !== "vendor") {
+                return res.status(400).json({
+                    success: false,
+                    message: "Choose Customer or Vendor.",
+                });
+            }
+
+            const result = await usersCollection.updateOne(
+                {
+                    _id: req.account._id,
+                    role: "customer",
+                    roleSelectionPending: true,
+                    isBlocked: { $ne: true },
+                },
+                {
+                    $set: {
+                        role,
+                        roleSelectionPending: false,
+                        updatedAt: new Date(),
+                    },
+                }
+            );
+
+            if (result.modifiedCount !== 1) {
+                return res.status(409).json({
+                    success: false,
+                    message: "Role selection is unavailable or already completed.",
+                });
+            }
+
+            res.json({
+                success: true,
+                message: "Your account role has been saved.",
+                data: {
+                    role,
+                    roleSelectionPending: false,
+                },
+            });
+        } catch (error) {
+            next(error);
+        }
+    });
 
     const menuItemsCollection = db.collection("menuItems");
 
