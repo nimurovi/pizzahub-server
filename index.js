@@ -74,6 +74,14 @@ async function startServer() {
 
         trustedOrigins: [clientUrl],
 
+        socialProviders: {
+            google: {
+                clientId: process.env.GOOGLE_CLIENT_ID,
+                clientSecret: process.env.GOOGLE_CLIENT_SECRET,
+                prompt: "select_account",
+            },
+        },
+
         database: mongodbAdapter(db),
 
         emailAndPassword: {
@@ -105,6 +113,39 @@ async function startServer() {
 
         hooks: {
             before: createAuthMiddleware(async (ctx) => {
+                // Only customer and vendor accounts can register publicly.
+                if (ctx.path === "/sign-up/email") {
+                    const role = ctx.body?.role ?? "customer";
+
+                    if (!["customer", "vendor"].includes(role)) {
+                        throw new APIError("BAD_REQUEST", {
+                            message: "Choose Customer or Vendor.",
+                        });
+                    }
+
+                    const name = ctx.body?.name;
+
+                    if (
+                        typeof name !== "string" ||
+                        name.trim().length < 2 ||
+                        name.trim().length > 80
+                    ) {
+                        throw new APIError("BAD_REQUEST", {
+                            message: "Name must contain 2–80 characters.",
+                        });
+                    }
+                }
+
+                // Prevent users from changing their role through other auth endpoints.
+                if (
+                    ctx.path !== "/sign-up/email" &&
+                    ctx.body &&
+                    Object.prototype.hasOwnProperty.call(ctx.body, "role")
+                ) {
+                    throw new APIError("FORBIDDEN", {
+                        message: "You cannot change your account role.",
+                    });
+                }
                 const passwordPaths = [
                     "/sign-up/email",
                     "/change-password",
