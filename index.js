@@ -2151,6 +2151,590 @@ async function startServer() {
             }
         }
     );
+
+    // ---------- Vendor menu management ----------
+
+    function vendorMenuIds(account) {
+        const ids = [String(account._id)];
+
+        if (account._id instanceof ObjectId) {
+            ids.push(account._id);
+        }
+
+        return ids;
+    }
+
+    function vendorMenuFilter(account, itemId) {
+        return {
+            _id: new ObjectId(itemId),
+            vendorId: { $in: vendorMenuIds(account) },
+        };
+    }
+
+    function validateVendorMenuId(req, res, next) {
+        if (!/^[a-fA-F0-9]{24}$/.test(req.params.id)) {
+            return res.status(400).json({
+                success: false,
+                message: "Invalid menu item ID.",
+            });
+        }
+
+        next();
+    }
+
+    function protectVendorMenuMutation(req, res, next) {
+        res.set("Cache-Control", "no-store");
+
+        if (req.get("origin") !== new URL(clientUrl).origin) {
+            return res.status(403).json({
+                success: false,
+                message: "This request is not allowed.",
+            });
+        }
+
+        next();
+    }
+
+    // Unlike the create route, a replacement image is optional.
+    function parseOptionalMenuImage(req, res, next) {
+        if (!req.is("multipart/form-data")) {
+            return res.status(415).json({
+                success: false,
+                message: "Submit the item using form data.",
+            });
+        }
+
+        receiveMenuImage(req, res, (error) => {
+            if (error) {
+                return res
+                    .status(error.code === "LIMIT_FILE_SIZE" ? 413 : 400)
+                    .json({
+                        success: false,
+                        message:
+                            error.code === "LIMIT_FILE_SIZE"
+                                ? "The image must be 2 MB or smaller."
+                                : "Upload one JPEG, PNG, or WebP image with valid item fields.",
+                    });
+            }
+
+            next();
+        });
+    }
+
+    function publicVendorMenuItem(item) {
+        return {
+            _id: String(item._id),
+            itemName: item.itemName,
+            category: item.category,
+            description: item.description,
+            price: item.price,
+            location: item.location,
+            images: Array.isArray(item.images) ? item.images : [],
+            status: item.status,
+            isAvailable: item.isAvailable === true,
+            createdAt: item.createdAt,
+            updatedAt: item.updatedAt,
+        };
+    }
+
+    function validateMenuEdit(body) {
+        const allowedFields = [
+            "itemName",
+            "category",
+            "description",
+            "price",
+            "location",
+        ];
+
+        if (
+            !body ||
+            typeof body !== "object" ||
+            Array.isArray(body) ||
+            Object.keys(body).some((key) => !allowedFields.includes(key)) ||
+            allowedFields.some((key) => typeof body[key] !== "string")
+        ) {
+            throw menuCreateError(400, "Provide all required item fields.");
+        }
+
+        const itemName = body.itemName.trim();
+        const category = body.category.trim();
+        const description = body.description.trim();
+        const location = body.location.trim();
+        const priceText = body.price.trim();
+
+        if (itemName.length < 2 || itemName.length > 100) {
+            throw menuCreateError(400, "Item name must contain 2–100 characters.");
+        }
+
+        if (!menuCategories.includes(category)) {
+            throw menuCreateError(400, "Choose a valid category.");
+        }
+
+        if (description.length < 10 || description.length > 2000) {
+            throw menuCreateError(
+                400,
+                "Description must contain 10–2000 characters."
+            );
+        }
+
+        if (location.length < 2 || location.length > 150) {
+            throw menuCreateError(400, "Location must contain 2–150 characters.");
+        }
+
+        const price = Number(priceText);
+        const priceMinor = Math.round(price * 100);
+
+        if (
+            !/^\d+(?:\.\d{1,2})?$/.test(priceText) ||
+            !Number.isFinite(price) ||
+            price <= 0 ||
+            price > 1_000_000 ||
+            !Number.isSafeInteger(priceMinor) ||
+            priceMinor < 1
+        ) {
+            throw menuCreateError(
+                400,
+                "Enter a price between 0.01 and 1,000,000 with up to two decimal places."
+            );
+        }
+
+        return {
+            itemName,
+            category,
+            description,
+            price: priceMinor / 100,
+            location,
+        };
+    }
+
+    async function uploadReplacementMenuImage(file) {
+        const apiKey = process.env.IMGBB_API_KEY;
+
+        if (!apiKey) {
+            throw menuCreateError(503, "Image uploads are currently unavailable.");
+        }
+
+        let imageBuffer;
+
+        try {
+            const metadata = await sharp(file.buffer, {
+                limitInputPixels: 20_000_000,
+            }).metadata();
+
+            if (
+                !["jpeg", "png", "webp"].includes(metadata.format) ||
+                (metadata.pages ?? 1) > 1
+            ) {
+                throw new Error("Unsupported image.");
+            }
+
+            imageBuffer = await sharp(file.buffer, {
+                limitInputPixels: 20_000_000,
+            })
+                .rotate()
+                .resize({
+                    width: 1600,
+                    height: 1600,
+                    fit: "inside",
+                    withoutEnlargement: true,
+                })
+                .webp({ quality: 85 })
+                .toBuffer();
+        } catch {
+            throw menuCreateError(
+                400,
+                "Upload a valid, non-animated JPEG, PNG, or WebP image."
+            );
+        }
+
+        const form = new FormData();
+        form.append("key", apiKey);
+        form.append("image", imageBuffer.toString("base64"));
+
+        const controller = new AbortController();
+        const timer = setTimeout(() => controller.abort(), 20_000);
+
+        try {
+            const response = await fetch("https://api.imgbb.com/1/upload", {
+                method: "POST",
+                body: form,
+                signal: controller.signal,
+            });
+
+            const result = await response.json();
+            const imageUrl = result?.data?.url;
+
+            if (
+                !response.ok ||
+                result.success !== true ||
+                typeof imageUrl !== "string" ||
+                new URL(imageUrl).protocol !== "https:"
+            ) {
+                throw new Error("Image upload failed.");
+            }
+
+            return imageUrl;
+        } catch {
+            throw menuCreateError(
+                502,
+                "Could not upload the replacement image. Please try again."
+            );
+        } finally {
+            clearTimeout(timer);
+        }
+    }
+
+    // Uses the same vendor lock as the create route.
+    // All operations affecting active-item slots must use this protocol.
+    async function withVendorMenuTransaction(account, operation) {
+        const databaseSession = client.startSession();
+
+        try {
+            return await databaseSession.withTransaction(
+                async () => {
+                    const vendorResult = await usersCollection.updateOne(
+                        {
+                            _id: account._id,
+                            role: "vendor",
+                            isBlocked: { $ne: true },
+                            roleSelectionPending: { $ne: true },
+                        },
+                        { $inc: { menuWriteVersion: 1 } },
+                        { session: databaseSession }
+                    );
+
+                    if (vendorResult.matchedCount !== 1) {
+                        throw menuCreateError(
+                            403,
+                            "Your account cannot manage menu items."
+                        );
+                    }
+
+                    return operation(databaseSession);
+                },
+                {
+                    readConcern: { level: "snapshot" },
+                    writeConcern: { w: "majority" },
+                    readPreference: "primary",
+                }
+            );
+        } finally {
+            await databaseSession.endSession();
+        }
+    }
+
+    async function ensureMenuSlotAvailable(account, itemId, session) {
+        // Premium entitlement will be connected after verified payment integration.
+        const activeItemLimit = 3;
+
+        const otherActiveItems = await menuItemsCollection.countDocuments(
+            {
+                _id: { $ne: itemId },
+                vendorId: { $in: vendorMenuIds(account) },
+                status: { $in: ["pending", "approved"] },
+                isAvailable: true,
+            },
+            { session }
+        );
+
+        if (otherActiveItems >= activeItemLimit) {
+            throw menuCreateError(
+                409,
+                "Your Free plan allows 3 active items. Make another item unavailable first."
+            );
+        }
+    }
+
+    function handleVendorMenuError(error, res, next) {
+        if (Number.isInteger(error?.httpStatus)) {
+            return res.status(error.httpStatus).json({
+                success: false,
+                message: error.message,
+            });
+        }
+
+        next(error);
+    }
+
+    // List only the signed-in vendor's items.
+    app.get(
+        "/api/vendor/menu",
+        requireAccount,
+        requireRole("vendor"),
+        async (req, res, next) => {
+            try {
+                res.set("Cache-Control", "no-store");
+
+                const pageText = req.query.page ?? "1";
+
+                if (
+                    typeof pageText !== "string" ||
+                    !/^[1-9]\d*$/.test(pageText) ||
+                    Number(pageText) > 100_000
+                ) {
+                    return res.status(400).json({
+                        success: false,
+                        message: "Invalid page number.",
+                    });
+                }
+
+                const page = Number(pageText);
+                const pageSize = 10;
+                const ownership = {
+                    vendorId: { $in: vendorMenuIds(req.account) },
+                };
+
+                const [result] = await menuItemsCollection
+                    .aggregate([
+                        { $match: ownership },
+                        {
+                            $facet: {
+                                items: [
+                                    { $sort: { createdAt: -1, _id: -1 } },
+                                    { $skip: (page - 1) * pageSize },
+                                    { $limit: pageSize },
+                                    {
+                                        $project: {
+                                            itemName: 1,
+                                            category: 1,
+                                            description: 1,
+                                            price: 1,
+                                            location: 1,
+                                            images: 1,
+                                            status: 1,
+                                            isAvailable: 1,
+                                            createdAt: 1,
+                                            updatedAt: 1,
+                                        },
+                                    },
+                                ],
+                                count: [{ $count: "total" }],
+                            },
+                        },
+                    ])
+                    .toArray();
+
+                const total = result?.count[0]?.total ?? 0;
+
+                return res.json({
+                    success: true,
+                    data: {
+                        items: (result?.items ?? []).map(publicVendorMenuItem),
+                        pagination: {
+                            page,
+                            pageSize,
+                            total,
+                            totalPages: Math.max(1, Math.ceil(total / pageSize)),
+                        },
+                    },
+                });
+            } catch (error) {
+                next(error);
+            }
+        }
+    );
+
+    // Vendor-only details, including pending and rejected items.
+    app.get(
+        "/api/vendor/menu/:id",
+        requireAccount,
+        requireRole("vendor"),
+        validateVendorMenuId,
+        async (req, res, next) => {
+            try {
+                res.set("Cache-Control", "no-store");
+
+                const item = await menuItemsCollection.findOne(
+                    vendorMenuFilter(req.account, req.params.id)
+                );
+
+                if (!item) {
+                    return res.status(404).json({
+                        success: false,
+                        message: "Menu item not found.",
+                    });
+                }
+
+                return res.json({
+                    success: true,
+                    data: publicVendorMenuItem(item),
+                });
+            } catch (error) {
+                next(error);
+            }
+        }
+    );
+
+    // Edit content. Every successful edit requires admin approval again.
+    app.patch(
+        "/api/vendor/menu/:id",
+        requireAccount,
+        requireRole("vendor"),
+        validateVendorMenuId,
+        protectVendorMenuMutation,
+        parseOptionalMenuImage,
+        async (req, res, next) => {
+            try {
+                const filter = vendorMenuFilter(req.account, req.params.id);
+                const changes = validateMenuEdit(req.body);
+
+                // Verify ownership before uploading anything.
+                const existing = await menuItemsCollection.findOne(filter);
+
+                if (!existing) {
+                    throw menuCreateError(404, "Menu item not found.");
+                }
+
+                const replacementImage = req.file
+                    ? await uploadReplacementMenuImage(req.file)
+                    : null;
+
+                await withVendorMenuTransaction(req.account, async (session) => {
+                    // Re-read inside the transaction to handle concurrent changes.
+                    const current = await menuItemsCollection.findOne(filter, {
+                        session,
+                    });
+
+                    if (!current) {
+                        throw menuCreateError(404, "Menu item not found.");
+                    }
+
+                    // Rejected -> pending may consume an active slot.
+                    if (current.isAvailable === true) {
+                        await ensureMenuSlotAvailable(
+                            req.account,
+                            current._id,
+                            session
+                        );
+                    }
+
+                    await menuItemsCollection.updateOne(
+                        filter,
+                        {
+                            $set: {
+                                ...changes,
+                                ...(replacementImage
+                                    ? { images: [replacementImage] }
+                                    : {}),
+                                status: "pending",
+                                updatedAt: new Date(),
+                            },
+                        },
+                        { session }
+                    );
+                });
+
+                return res.json({
+                    success: true,
+                    message: "Item updated and submitted for admin approval.",
+                });
+            } catch (error) {
+                handleVendorMenuError(error, res, next);
+            }
+        }
+    );
+
+    // Change availability without changing approval status.
+    app.patch(
+        "/api/vendor/menu/:id/availability",
+        requireAccount,
+        requireRole("vendor"),
+        validateVendorMenuId,
+        protectVendorMenuMutation,
+        async (req, res, next) => {
+            try {
+                if (!req.is("application/json")) {
+                    throw menuCreateError(415, "Send availability as JSON.");
+                }
+
+                const body = req.body;
+
+                if (
+                    !body ||
+                    typeof body !== "object" ||
+                    Array.isArray(body) ||
+                    Object.keys(body).length !== 1 ||
+                    typeof body.isAvailable !== "boolean"
+                ) {
+                    throw menuCreateError(
+                        400,
+                        "Provide only an isAvailable boolean."
+                    );
+                }
+
+                const filter = vendorMenuFilter(req.account, req.params.id);
+
+                await withVendorMenuTransaction(req.account, async (session) => {
+                    const item = await menuItemsCollection.findOne(filter, {
+                        session,
+                    });
+
+                    if (!item) {
+                        throw menuCreateError(404, "Menu item not found.");
+                    }
+
+                    if (
+                        body.isAvailable &&
+                        ["pending", "approved"].includes(item.status)
+                    ) {
+                        await ensureMenuSlotAvailable(req.account, item._id, session);
+                    }
+
+                    await menuItemsCollection.updateOne(
+                        filter,
+                        {
+                            $set: {
+                                isAvailable: body.isAvailable,
+                                updatedAt: new Date(),
+                            },
+                        },
+                        { session }
+                    );
+                });
+
+                return res.json({
+                    success: true,
+                    message: body.isAvailable
+                        ? "Availability enabled. Only approved items appear to customers."
+                        : "Item marked unavailable.",
+                });
+            } catch (error) {
+                handleVendorMenuError(error, res, next);
+            }
+        }
+    );
+
+    // Delete only the vendor's own item.
+    // Existing order snapshots are preserved.
+    app.delete(
+        "/api/vendor/menu/:id",
+        requireAccount,
+        requireRole("vendor"),
+        validateVendorMenuId,
+        protectVendorMenuMutation,
+        async (req, res, next) => {
+            try {
+                const filter = vendorMenuFilter(req.account, req.params.id);
+
+                await withVendorMenuTransaction(req.account, async (session) => {
+                    const result = await menuItemsCollection.deleteOne(filter, {
+                        session,
+                    });
+
+                    if (result.deletedCount !== 1) {
+                        throw menuCreateError(404, "Menu item not found.");
+                    }
+                });
+
+                return res.json({
+                    success: true,
+                    message: "Menu item deleted.",
+                });
+            } catch (error) {
+                handleVendorMenuError(error, res, next);
+            }
+        }
+    );
     // ==================================================
     // Unknown routes
     // ==================================================
