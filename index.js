@@ -1776,6 +1776,381 @@ async function startServer() {
         }
     );
 
+
+    // ==================================================
+    // Vendor: Create menu item
+    // ==================================================
+
+    const menuCategories = [
+        "classic-pizzas",
+        "vegetarian-pizzas",
+        "meat-lovers",
+        "specialty-gourmet-pizzas",
+        "sides-appetizers",
+        "beverages-desserts",
+    ];
+
+    const receiveMenuImage = multer({
+        storage: multer.memoryStorage(),
+        limits: {
+            fileSize: 2 * 1024 * 1024,
+            files: 1,
+            fields: 5,
+            parts: 6,
+            fieldSize: 10_000,
+        },
+        fileFilter(req, file, callback) {
+            if (
+                !["image/jpeg", "image/png", "image/webp"].includes(file.mimetype)
+            ) {
+                return callback(
+                    new Error("Please upload a JPG, PNG, or WebP image.")
+                );
+            }
+
+            callback(null, true);
+        },
+    }).single("image");
+
+    function checkMenuCreateRequest(req, res, next) {
+        if (req.get("origin") !== new URL(clientUrl).origin) {
+            return res.status(403).json({
+                success: false,
+                message: "This request is not allowed.",
+            });
+        }
+
+        if (!process.env.IMGBB_API_KEY?.trim()) {
+            return res.status(503).json({
+                success: false,
+                message: "Image uploads are not configured.",
+            });
+        }
+
+        if (!req.is("multipart/form-data")) {
+            return res.status(415).json({
+                success: false,
+                message: "Submit the menu item with an image file.",
+            });
+        }
+
+        next();
+    }
+
+    function parseMenuUpload(req, res, next) {
+        receiveMenuImage(req, res, (error) => {
+            if (error) {
+                return res
+                    .status(error.code === "LIMIT_FILE_SIZE" ? 413 : 400)
+                    .json({
+                        success: false,
+                        message:
+                            error.code === "LIMIT_FILE_SIZE"
+                                ? "The image must be 2 MB or smaller."
+                                : "Upload one JPG, PNG, or WebP image with the required fields.",
+                    });
+            }
+
+            if (!req.file) {
+                return res.status(400).json({
+                    success: false,
+                    message: "A menu item image is required.",
+                });
+            }
+
+            next();
+        });
+    }
+
+    function menuCreateError(status, message) {
+        const error = new Error(message);
+        error.httpStatus = status;
+        return error;
+    }
+
+    app.post(
+        "/api/vendor/menu",
+        requireAccount,
+        requireRole("vendor"),
+        checkMenuCreateRequest,
+        parseMenuUpload,
+        async (req, res, next) => {
+            let databaseSession;
+
+            try {
+                res.set("Cache-Control", "no-store");
+
+                const allowedFields = [
+                    "itemName",
+                    "category",
+                    "description",
+                    "price",
+                    "location",
+                ];
+
+                const body = req.body;
+
+                if (
+                    !body ||
+                    allowedFields.some((key) => typeof body[key] !== "string") ||
+                    Object.keys(body).some((key) => !allowedFields.includes(key))
+                ) {
+                    throw menuCreateError(
+                        400,
+                        "Complete all required fields. Unsupported fields are not allowed."
+                    );
+                }
+
+                const itemName = body.itemName.trim();
+                const category = body.category.trim();
+                const description = body.description.trim();
+                const location = body.location.trim();
+                const priceText = body.price.trim();
+
+                if (itemName.length < 2 || itemName.length > 100) {
+                    throw menuCreateError(
+                        400,
+                        "Item name must contain 2–100 characters."
+                    );
+                }
+
+                if (!menuCategories.includes(category)) {
+                    throw menuCreateError(400, "Choose a valid category.");
+                }
+
+                if (description.length < 10 || description.length > 2000) {
+                    throw menuCreateError(
+                        400,
+                        "Description must contain 10–2000 characters."
+                    );
+                }
+
+                if (location.length < 2 || location.length > 150) {
+                    throw menuCreateError(
+                        400,
+                        "Location must contain 2–150 characters."
+                    );
+                }
+
+                if (!/^\d+(?:\.\d{1,2})?$/.test(priceText)) {
+                    throw menuCreateError(
+                        400,
+                        "Enter a valid price with at most two decimal places."
+                    );
+                }
+
+                const price = Number(priceText);
+                const priceMinor = Math.round(price * 100);
+
+                if (
+                    !Number.isFinite(price) ||
+                    price <= 0 ||
+                    price > 1_000_000 ||
+                    !Number.isSafeInteger(priceMinor) ||
+                    priceMinor < 1
+                ) {
+                    throw menuCreateError(
+                        400,
+                        "Price must be between ৳0.01 and ৳1,000,000."
+                    );
+                }
+
+                const vendorId = String(req.account._id);
+                const vendorIds = [vendorId];
+
+                if (req.account._id instanceof ObjectId) {
+                    vendorIds.push(req.account._id);
+                }
+
+                const activeFilter = {
+                    vendorId: { $in: vendorIds },
+                    status: { $in: ["pending", "approved"] },
+                    isAvailable: true,
+                };
+
+                // Stage 2: all vendors remain Free until verified payments launch.
+                const activeItemLimit = 3;
+
+                // Early check avoids an unnecessary image upload.
+                // The authoritative check is repeated inside the transaction.
+                const currentCount =
+                    await menuItemsCollection.countDocuments(activeFilter);
+
+                if (currentCount >= activeItemLimit) {
+                    throw menuCreateError(
+                        409,
+                        "Your Free plan allows up to 3 active items."
+                    );
+                }
+
+                let processedImage;
+
+                try {
+                    const image = sharp(req.file.buffer, {
+                        limitInputPixels: 20_000_000,
+                        failOn: "error",
+                    });
+
+                    const metadata = await image.metadata();
+
+                    if (
+                        !["jpeg", "png", "webp"].includes(metadata.format) ||
+                        (metadata.pages ?? 1) > 1
+                    ) {
+                        throw new Error("Unsupported image.");
+                    }
+
+                    processedImage = await image
+                        .rotate()
+                        .resize({
+                            width: 1600,
+                            height: 1600,
+                            fit: "inside",
+                            withoutEnlargement: true,
+                        })
+                        .webp({ quality: 85 })
+                        .toBuffer();
+                } catch {
+                    throw menuCreateError(
+                        400,
+                        "Choose a valid, non-animated JPG, PNG, or WebP image."
+                    );
+                }
+
+                let imageUrl;
+
+                try {
+                    const uploadBody = new FormData();
+
+                    uploadBody.append("key", process.env.IMGBB_API_KEY.trim());
+                    uploadBody.append("image", processedImage.toString("base64"));
+
+                    const response = await fetch(
+                        "https://api.imgbb.com/1/upload",
+                        {
+                            method: "POST",
+                            body: uploadBody,
+                            signal: AbortSignal.timeout(20_000),
+                        }
+                    );
+
+                    const result = await response.json();
+
+                    if (
+                        !response.ok ||
+                        result?.success !== true ||
+                        typeof result.data?.url !== "string"
+                    ) {
+                        throw new Error("Upload failed.");
+                    }
+
+                    const url = new URL(result.data.url);
+
+                    if (url.protocol !== "https:") {
+                        throw new Error("Invalid image URL.");
+                    }
+
+                    imageUrl = url.href;
+                } catch {
+                    throw menuCreateError(
+                        502,
+                        "The image could not be uploaded. Please try again."
+                    );
+                }
+
+                const now = new Date();
+
+                const item = {
+                    _id: new ObjectId(),
+                    vendorId,
+                    itemName,
+                    category,
+                    description,
+                    price: priceMinor / 100,
+                    location,
+                    images: [imageUrl],
+                    status: "pending",
+                    isAvailable: true,
+                    createdAt: now,
+                    updatedAt: now,
+                };
+
+                databaseSession = client.startSession();
+
+                await databaseSession.withTransaction(
+                    async () => {
+                        // Serialize menu-slot changes for this vendor.
+                        // Other availability/resubmission routes must use this same
+                        // transaction pattern when we implement them.
+                        const vendorResult = await usersCollection.updateOne(
+                            {
+                                _id: req.account._id,
+                                role: "vendor",
+                                isBlocked: { $ne: true },
+                                roleSelectionPending: { $ne: true },
+                            },
+                            {
+                                $inc: { menuWriteVersion: 1 },
+                            },
+                            { session: databaseSession }
+                        );
+
+                        if (vendorResult.matchedCount !== 1) {
+                            throw menuCreateError(
+                                403,
+                                "Your account cannot create menu items."
+                            );
+                        }
+
+                        const activeCount = await menuItemsCollection.countDocuments(
+                            activeFilter,
+                            { session: databaseSession }
+                        );
+
+                        if (activeCount >= activeItemLimit) {
+                            throw menuCreateError(
+                                409,
+                                "Your Free plan allows up to 3 active items."
+                            );
+                        }
+
+                        await menuItemsCollection.insertOne(item, {
+                            session: databaseSession,
+                        });
+                    },
+                    {
+                        readConcern: { level: "snapshot" },
+                        writeConcern: { w: "majority" },
+                        readPreference: "primary",
+                    }
+                );
+
+                return res.status(201).json({
+                    success: true,
+                    message: "Menu item submitted. Waiting for admin approval.",
+                    data: {
+                        _id: String(item._id),
+                        itemName: item.itemName,
+                        status: item.status,
+                        isAvailable: item.isAvailable,
+                    },
+                });
+            } catch (error) {
+                if (error.httpStatus) {
+                    return res.status(error.httpStatus).json({
+                        success: false,
+                        message: error.message,
+                    });
+                }
+
+                next(error);
+            } finally {
+                if (databaseSession) {
+                    await databaseSession.endSession();
+                }
+            }
+        }
+    );
     // ==================================================
     // Unknown routes
     // ==================================================
