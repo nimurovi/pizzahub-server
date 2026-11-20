@@ -8,6 +8,9 @@ import { betterAuth } from "better-auth";
 import { mongodbAdapter } from "@better-auth/mongo-adapter";
 
 import { createAuthMiddleware, APIError } from "better-auth/api";
+import multer from "multer";
+import sharp from "sharp";
+
 
 // --------------------------------------------------
 // 1. Environment configuration
@@ -284,40 +287,40 @@ async function startServer() {
         });
     });
     function requireRole(...allowedRoles) {
-  return (req, res, next) => {
-    const account = req.account;
+        return (req, res, next) => {
+            const account = req.account;
 
-    if (!account) {
-      return res.status(401).json({
-        success: false,
-        message: "Please sign in first.",
-      });
+            if (!account) {
+                return res.status(401).json({
+                    success: false,
+                    message: "Please sign in first.",
+                });
+            }
+
+            if (account.isBlocked === true) {
+                return res.status(403).json({
+                    success: false,
+                    message: "Your account is blocked.",
+                });
+            }
+
+            if (account.roleSelectionPending === true) {
+                return res.status(403).json({
+                    success: false,
+                    message: "Complete your account role selection first.",
+                });
+            }
+
+            if (!allowedRoles.includes(account.role)) {
+                return res.status(403).json({
+                    success: false,
+                    message: "You do not have permission to perform this action.",
+                });
+            }
+
+            next();
+        };
     }
-
-    if (account.isBlocked === true) {
-      return res.status(403).json({
-        success: false,
-        message: "Your account is blocked.",
-      });
-    }
-
-    if (account.roleSelectionPending === true) {
-      return res.status(403).json({
-        success: false,
-        message: "Complete your account role selection first.",
-      });
-    }
-
-    if (!allowedRoles.includes(account.role)) {
-      return res.status(403).json({
-        success: false,
-        message: "You do not have permission to perform this action.",
-      });
-    }
-
-    next();
-  };
-}
 
     // Save a role once. Never accept a user ID from the browser.
     app.post("/api/onboarding/role", requireAccount, async (req, res, next) => {
@@ -382,12 +385,378 @@ async function startServer() {
         }
     });
 
+    app.patch("/api/profile", requireAccount, async (req, res, next) => {
+        try {
+            if (req.get("origin") !== new URL(clientUrl).origin) {
+                return res.status(403).json({
+                    success: false,
+                    message: "Request origin is not allowed.",
+                });
+            }
+
+            if (!req.is("application/json")) {
+                return res.status(415).json({
+                    success: false,
+                    message: "Send the request as JSON.",
+                });
+            }
+
+            const body = req.body;
+
+            if (
+                !body ||
+                typeof body !== "object" ||
+                Array.isArray(body) ||
+                Object.keys(body).some((key) => key !== "name")
+            ) {
+                return res.status(400).json({
+                    success: false,
+                    message: "Only your name can be updated here.",
+                });
+            }
+
+            const name = typeof body.name === "string" ? body.name.trim() : "";
+
+            if (name.length < 2 || name.length > 80) {
+                return res.status(400).json({
+                    success: false,
+                    message: "Name must contain 2–80 characters.",
+                });
+            }
+
+            const result = await usersCollection.updateOne(
+                {
+                    _id: req.account._id,
+                    isBlocked: { $ne: true },
+                },
+                {
+                    $set: {
+                        name,
+                        updatedAt: new Date(),
+                    },
+                }
+            );
+
+            if (result.matchedCount !== 1) {
+                return res.status(403).json({
+                    success: false,
+                    message: "Your profile could not be updated.",
+                });
+            }
+
+            res.json({
+                success: true,
+                message: "Profile updated successfully.",
+                data: { name },
+            });
+        } catch (error) {
+            next(error);
+        }
+    });
+
+    // Accept one profile image, up to 2 MB.
+    const receiveProfileImage = multer({
+        storage: multer.memoryStorage(),
+        limits: {
+            fileSize: 2 * 1024 * 1024,
+            files: 1,
+            fields: 0,
+            parts: 2,
+        },
+        fileFilter(req, file, callback) {
+            const allowedTypes = [
+                "image/jpeg",
+                "image/png",
+                "image/webp",
+            ];
+
+            if (!allowedTypes.includes(file.mimetype)) {
+                return callback(
+                    new Error("Please select a JPG, PNG, or WebP image.")
+                );
+            }
+
+            callback(null, true);
+        },
+    }).single("image");
+
+    function checkImageUploadRequest(req, res, next) {
+        // Protect this cookie-authenticated upload from cross-site requests.
+        if (req.get("origin") !== new URL(clientUrl).origin) {
+            return res.status(403).json({
+                success: false,
+                message: "This request is not allowed.",
+            });
+        }
+
+        if (!process.env.IMGBB_API_KEY?.trim()) {
+            return res.status(503).json({
+                success: false,
+                message: "Image uploads are not configured yet.",
+            });
+        }
+
+        if (!req.is("multipart/form-data")) {
+            return res.status(415).json({
+                success: false,
+                message: "Please send the image as form data.",
+            });
+        }
+
+        next();
+    }
+
+    function parseProfileImage(req, res, next) {
+        receiveProfileImage(req, res, (error) => {
+            if (error) {
+                const tooLarge = error.code === "LIMIT_FILE_SIZE";
+
+                let message = "Please upload one JPG, PNG, or WebP image.";
+
+                if (tooLarge) {
+                    message = "Your profile image must be 2 MB or smaller.";
+                } else if (!(error instanceof multer.MulterError)) {
+                    message = "Please select a valid JPG, PNG, or WebP image.";
+                }
+
+                return res.status(tooLarge ? 413 : 400).json({
+                    success: false,
+                    message,
+                });
+            }
+
+            if (!req.file) {
+                return res.status(400).json({
+                    success: false,
+                    message: "Please select a profile image.",
+                });
+            }
+
+            next();
+        });
+    }
+
+    app.post(
+        "/api/profile/image",
+        requireAccount,
+        checkImageUploadRequest,
+        parseProfileImage,
+        async (req, res, next) => {
+            let processedImage;
+
+            // Validate the actual image contents, not just its file extension.
+            try {
+                const image = sharp(req.file.buffer, {
+                    limitInputPixels: 20_000_000,
+                    failOn: "error",
+                });
+
+                const metadata = await image.metadata();
+
+                if (
+                    !["jpeg", "png", "webp"].includes(metadata.format) ||
+                    (metadata.pages ?? 1) > 1
+                ) {
+                    return res.status(400).json({
+                        success: false,
+                        message: "Use a non-animated JPG, PNG, or WebP image.",
+                    });
+                }
+
+                processedImage = await image
+                    .rotate()
+                    .resize(400, 400, {
+                        fit: "cover",
+                        position: "centre",
+                        withoutEnlargement: true,
+                    })
+                    .webp({ quality: 85 })
+                    .toBuffer();
+            } catch {
+                return res.status(400).json({
+                    success: false,
+                    message:
+                        "This image could not be processed. Try a smaller JPG, PNG, or WebP image.",
+                });
+            }
+
+            let imageUrl;
+
+            try {
+                const uploadBody = new FormData();
+
+                uploadBody.append("key", process.env.IMGBB_API_KEY.trim());
+                uploadBody.append("image", processedImage.toString("base64"));
+
+                const uploadResponse = await fetch(
+                    "https://api.imgbb.com/1/upload",
+                    {
+                        method: "POST",
+                        body: uploadBody,
+                        signal: AbortSignal.timeout(20_000),
+                    }
+                );
+
+                const uploadResult = await uploadResponse.json();
+                if (!uploadResponse.ok || uploadResult.success !== true) {
+                    console.error("ImgBB rejected the upload:", {
+                        status: uploadResponse.status,
+                        message:
+                            uploadResult.error?.message ||
+                            uploadResult.data?.error?.message ||
+                            "No error message returned",
+                    });
+                }
+                if (
+                    !uploadResponse.ok ||
+                    uploadResult.success !== true ||
+                    typeof uploadResult.data?.url !== "string"
+                ) {
+                    throw new Error("Image hosting failed.");
+                }
+
+                const uploadedUrl = new URL(uploadResult.data.url);
+
+                if (uploadedUrl.protocol !== "https:") {
+                    throw new Error("Invalid image URL.");
+                }
+
+                imageUrl = uploadedUrl.href;
+            } catch (error) {
+                console.error("Profile image upload failed:", {
+                    name: error?.name,
+                    message: error?.message,
+                    networkCode: error?.cause?.code,
+                });
+
+                const timedOut = error?.name === "TimeoutError";
+                return res.status(timedOut ? 504 : 502).json({
+                    success: false,
+                    message: timedOut
+                        ? "Image upload timed out. Please try again."
+                        : "The image service could not complete your upload. Please try again.",
+                });
+            }
+
+            try {
+                // The account ID comes from the verified session.
+                // Never accept a user ID or email from the upload form.
+                const result = await usersCollection.updateOne(
+                    {
+                        _id: req.account._id,
+                        isBlocked: { $ne: true },
+                    },
+                    {
+                        $set: {
+                            image: imageUrl,
+                            updatedAt: new Date(),
+                        },
+                    }
+                );
+
+                if (result.matchedCount !== 1) {
+                    return res.status(403).json({
+                        success: false,
+                        message: "Your account cannot update its profile image.",
+                    });
+                }
+
+                return res.status(200).json({
+                    success: true,
+                    message: "Profile image updated successfully.",
+                    data: {
+                        image: imageUrl,
+                    },
+                });
+            } catch (error) {
+                next(error);
+            }
+        }
+    );
+
     const menuItemsCollection = db.collection("menuItems");
 
     // --------------------------------------------------
     // Development demo data
     // Run manually with: node index.js --seed
     // --------------------------------------------------
+
+    function activeVendorStages() {
+        return [
+            {
+                $lookup: {
+                    from: "users",
+                    let: {
+                        vendorStringId: {
+                            $convert: {
+                                input: "$vendorId",
+                                to: "string",
+                                onError: null,
+                                onNull: null,
+                            },
+                        },
+                        vendorObjectId: {
+                            $convert: {
+                                input: "$vendorId",
+                                to: "objectId",
+                                onError: null,
+                                onNull: null,
+                            },
+                        },
+                    },
+                    pipeline: [
+                        {
+                            $match: {
+                                role: "vendor",
+                                isBlocked: { $ne: true },
+                                roleSelectionPending: { $ne: true },
+                                $expr: {
+                                    $or: [
+                                        { $eq: ["$_id", "$$vendorStringId"] },
+                                        { $eq: ["$_id", "$$vendorObjectId"] },
+                                    ],
+                                },
+                            },
+                        },
+                        {
+                            $project: {
+                                name: 1,
+                                image: 1,
+                            },
+                        },
+                        { $limit: 1 },
+                    ],
+                    as: "vendor",
+                },
+            },
+
+            // Removes items whose vendor was not found or is inactive.
+            { $unwind: "$vendor" },
+
+            {
+                $set: {
+                    vendorId: { $toString: "$vendor._id" },
+                    vendorName: "$vendor.name",
+                    vendorImage: { $ifNull: ["$vendor.image", null] },
+                },
+            },
+        ];
+    }
+
+    const publicMenuProjection = {
+        _id: 1,
+        itemName: 1,
+        description: 1,
+        category: 1,
+        price: 1,
+        location: 1,
+        images: 1,
+        vendorId: 1,
+        vendorName: 1,
+        vendorImage: 1,
+        createdAt: 1,
+    };
+
 
     if (process.argv.includes("--seed")) {
         if (process.env.NODE_ENV === "production") {
@@ -504,33 +873,118 @@ async function startServer() {
     // Public featured menu endpoint
     app.get("/api/menu/featured", async (req, res, next) => {
         try {
+            res.set("Cache-Control", "no-store");
+
             const items = await menuItemsCollection
-                .find(
+                .aggregate([
                     {
-                        status: "approved",
-                        isAvailable: true,
-                    },
-                    {
-                        projection: {
-                            itemName: 1,
-                            category: 1,
-                            description: 1,
-                            price: 1,
-                            location: 1,
-                            images: 1,
-                            vendorId: 1,
-                            vendorName: 1,
-                            createdAt: 1,
+                        $match: {
+                            status: "approved",
+                            isAvailable: true,
                         },
-                    }
-                )
-                .sort({ createdAt: -1, _id: -1 })
-                .limit(6)
+                    },
+                    ...activeVendorStages(),
+                    { $sort: { createdAt: -1, _id: -1 } },
+                    { $limit: 6 },
+                    { $project: publicMenuProjection },
+                ])
                 .toArray();
 
-            res.json({
+            return res.json({
                 success: true,
                 data: items,
+            });
+        } catch (error) {
+            next(error);
+        }
+    });
+
+    // Private: read one approved, available menu item.
+    app.get("/api/menu/:id", requireAccount, async (req, res, next) => {
+        try {
+            res.set("Cache-Control", "no-store");
+
+            const { id } = req.params;
+
+            if (!/^[a-fA-F0-9]{24}$/.test(id)) {
+                return res.status(400).json({
+                    success: false,
+                    message: "Invalid menu item ID.",
+                });
+            }
+
+            const item = await menuItemsCollection.findOne(
+                {
+                    _id: new ObjectId(id),
+                    status: "approved",
+                    isAvailable: true,
+                },
+                {
+                    projection: {
+                        itemName: 1,
+                        description: 1,
+                        category: 1,
+                        price: 1,
+                        location: 1,
+                        images: 1,
+                        vendorId: 1,
+                    },
+                }
+            );
+
+            if (!item) {
+                return res.status(404).json({
+                    success: false,
+                    message: "This menu item is unavailable or does not exist.",
+                });
+            }
+
+            const vendorId = String(item.vendorId ?? "");
+
+            if (!vendorId) {
+                return res.status(404).json({
+                    success: false,
+                    message: "This item's vendor is unavailable.",
+                });
+            }
+
+            // Support existing string IDs and MongoDB ObjectIds.
+            const possibleIds = [vendorId];
+
+            if (/^[a-fA-F0-9]{24}$/.test(vendorId)) {
+                possibleIds.push(new ObjectId(vendorId));
+            }
+
+            const vendor = await usersCollection.findOne(
+                {
+                    _id: { $in: possibleIds },
+                    role: "vendor",
+                    isBlocked: { $ne: true },
+                    roleSelectionPending: { $ne: true },
+                },
+                {
+                    projection: {
+                        name: 1,
+                        image: 1,
+                    },
+                }
+            );
+
+            if (!vendor) {
+                return res.status(404).json({
+                    success: false,
+                    message: "This item's vendor is unavailable.",
+                });
+            }
+
+            return res.status(200).json({
+                success: true,
+                data: {
+                    ...item,
+                    vendorId: String(vendor._id),
+                    vendorName: vendor.name,
+                    vendorImage: vendor.image ?? null,
+                },
             });
         } catch (error) {
             next(error);
@@ -542,133 +996,139 @@ async function startServer() {
     // --------------------------------------------------
 
     app.get("/api/menu", async (req, res, next) => {
-        try {
-            const allowedCategories = [
-                "classic-pizzas",
-                "vegetarian-pizzas",
-                "meat-lovers",
-                "specialty-gourmet-pizzas",
-                "sides-appetizers",
-                "beverages-desserts",
-            ];
+  try {
+    res.set("Cache-Control", "no-store");
 
-            // Reject objects/arrays and overly long query values.
-            function readQuery(name, fallback = "") {
-                const value = req.query[name];
+    function readQuery(name, fallback = "") {
+      const value = req.query[name];
 
-                if (value === undefined) return fallback;
+      if (value === undefined) return fallback;
 
-                if (typeof value !== "string" || value.length > 100) {
-                    throw new Error("INVALID_QUERY");
-                }
+      if (typeof value !== "string" || value.length > 100) {
+        throw new Error("INVALID_MENU_QUERY");
+      }
 
-                return value.trim();
-            }
+      return value.trim();
+    }
 
-            const search = readQuery("search");
-            const category = readQuery("category");
-            const location = readQuery("location");
-            const sort = readQuery("sort", "newest");
-            const pageValue = readQuery("page", "1");
+    function escapeSearch(value) {
+      return value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+    }
 
-            if (
-                (category && !allowedCategories.includes(category)) ||
-                !["newest", "price-asc", "price-desc"].includes(sort) ||
-                !/^[1-9]\d*$/.test(pageValue)
-            ) {
-                return res.status(400).json({
-                    success: false,
-                    message: "Invalid menu filters.",
-                });
-            }
+    const search = readQuery("search");
+    const category = readQuery("category");
+    const location = readQuery("location");
+    const sort = readQuery("sort", "newest");
+    const pageText = readQuery("page", "1");
 
-            const page = Number(pageValue);
-            const limit = 12;
+    const allowedCategories = [
+      "classic-pizzas",
+      "vegetarian-pizzas",
+      "meat-lovers",
+      "specialty-gourmet-pizzas",
+      "sides-appetizers",
+      "beverages-desserts",
+    ];
 
-            if (!Number.isSafeInteger(page) || page > 10000) {
-                return res.status(400).json({
-                    success: false,
-                    message: "Invalid page number.",
-                });
-            }
+    if (
+      category &&
+      category !== "all" &&
+      !allowedCategories.includes(category)
+    ) {
+      throw new Error("INVALID_MENU_QUERY");
+    }
 
-            // Treat search input as literal text, not a regex expression.
-            const escapeRegex = (value) =>
-                value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+    if (!["newest", "price-asc", "price-desc"].includes(sort)) {
+      throw new Error("INVALID_MENU_QUERY");
+    }
 
-            const filter = {
-                status: "approved",
-                isAvailable: true,
-            };
+    if (!/^[1-9]\d*$/.test(pageText)) {
+      throw new Error("INVALID_MENU_QUERY");
+    }
 
-            if (search) {
-                filter.itemName = {
-                    $regex: escapeRegex(search),
-                    $options: "i",
-                };
-            }
+    const page = Number(pageText);
+    const limit = 12;
 
-            if (category) {
-                filter.category = category;
-            }
+    if (!Number.isSafeInteger(page) || page > 10000) {
+      throw new Error("INVALID_MENU_QUERY");
+    }
 
-            if (location) {
-                filter.location = {
-                    $regex: escapeRegex(location),
-                    $options: "i",
-                };
-            }
+    const filter = {
+      status: "approved",
+      isAvailable: true,
+    };
 
-            const sorting =
-                sort === "price-asc"
-                    ? { price: 1, _id: 1 }
-                    : sort === "price-desc"
-                        ? { price: -1, _id: -1 }
-                        : { createdAt: -1, _id: -1 };
+    if (search) {
+      filter.itemName = {
+        $regex: escapeSearch(search),
+        $options: "i",
+      };
+    }
 
-            const [items, total] = await Promise.all([
-                menuItemsCollection
-                    .find(filter, {
-                        projection: {
-                            itemName: 1,
-                            category: 1,
-                            description: 1,
-                            price: 1,
-                            location: 1,
-                            images: 1,
-                            vendorId: 1,
-                            vendorName: 1,
-                        },
-                    })
-                    .sort(sorting)
-                    .skip((page - 1) * limit)
-                    .limit(limit)
-                    .toArray(),
+    if (category && category !== "all") {
+      filter.category = category;
+    }
 
-                menuItemsCollection.countDocuments(filter),
-            ]);
+    if (location && location !== "all") {
+      filter.location = {
+        $regex: escapeSearch(location),
+        $options: "i",
+      };
+    }
 
-            res.json({
-                success: true,
-                data: items,
-                pagination: {
-                    page,
-                    limit,
-                    total,
-                    totalPages: Math.ceil(total / limit),
-                },
-            });
-        } catch (error) {
-            if (error.message === "INVALID_QUERY") {
-                return res.status(400).json({
-                    success: false,
-                    message: "Invalid menu filters.",
-                });
-            }
+    const sortOptions =
+      sort === "price-asc"
+        ? { price: 1, _id: 1 }
+        : sort === "price-desc"
+          ? { price: -1, _id: -1 }
+          : { createdAt: -1, _id: -1 };
 
-            next(error);
-        }
+    const [result] = await menuItemsCollection
+      .aggregate([
+        { $match: filter },
+
+        // Check the vendor before pagination and counting.
+        ...activeVendorStages(),
+
+        {
+          $facet: {
+            items: [
+              { $sort: sortOptions },
+              { $skip: (page - 1) * limit },
+              { $limit: limit },
+              { $project: publicMenuProjection },
+            ],
+            totalCount: [
+              { $count: "total" },
+            ],
+          },
+        },
+      ])
+      .toArray();
+
+    const total = result?.totalCount?.[0]?.total ?? 0;
+
+    return res.json({
+      success: true,
+      data: result?.items ?? [],
+      pagination: {
+        page,
+        limit,
+        total,
+        totalPages: Math.ceil(total / limit),
+      },
     });
+  } catch (error) {
+    if (error.message === "INVALID_MENU_QUERY") {
+      return res.status(400).json({
+        success: false,
+        message: "Invalid menu filters or page number.",
+      });
+    }
+
+    next(error);
+  }
+});
 
     // --------------------------------------------------
     // 4. Unknown routes
