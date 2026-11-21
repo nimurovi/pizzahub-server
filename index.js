@@ -8,6 +8,8 @@ import { mongodbAdapter } from "@better-auth/mongo-adapter";
 import { createAuthMiddleware, APIError } from "better-auth/api";
 import multer from "multer";
 import sharp from "sharp";
+import { createBilling } from "./billing.js";
+import { premiumExpression } from "./billing-policy.js";
 
 // ==================================================
 // Environment configuration
@@ -218,6 +220,8 @@ async function startServer() {
     // Better Auth
     // ==================================================
 
+    const billing = await createBilling({ client, db, clientUrl });
+
     const auth = betterAuth({
         appName: "PizzaHub",
         baseURL: process.env.BETTER_AUTH_URL,
@@ -370,6 +374,7 @@ async function startServer() {
     // Better Auth must come before express.json().
     app.all(/^\/api\/auth(?:\/.*)?$/, toNodeHandler(auth));
 
+    billing.mountWebhook(app);
     app.use(express.json({ limit: "100kb" }));
 
     // ==================================================
@@ -860,67 +865,33 @@ async function startServer() {
 
     function activeVendorStages() {
         return [
-            {
-                $lookup: {
-                    from: "users",
-
-                    let: {
-                        vendorStringId: {
-                            $convert: {
-                                input: "$vendorId",
-                                to: "string",
-                                onError: null,
-                                onNull: null,
-                            },
-                        },
-
-                        vendorObjectId: {
-                            $convert: {
-                                input: "$vendorId",
-                                to: "objectId",
-                                onError: null,
-                                onNull: null,
-                            },
-                        },
-                    },
-
-                    pipeline: [
-                        {
-                            $match: {
-                                role: "vendor",
-                                isBlocked: { $ne: true },
-                                roleSelectionPending: { $ne: true },
-
-                                $expr: {
-                                    $or: [
-                                        { $eq: ["$_id", "$$vendorStringId"] },
-                                        { $eq: ["$_id", "$$vendorObjectId"] },
-                                    ],
-                                },
-                            },
-                        },
-                        {
-                            $project: {
-                                name: 1,
-                                image: 1,
-                            },
-                        },
-                        { $limit: 1 },
-                    ],
-
-                    as: "vendor",
-                },
-            },
-
+            { $lookup: {
+                from: "users",
+                let: { vendorId: { $convert: { input: "$vendorId", to: "string", onError: null, onNull: null } } },
+                pipeline: [
+                    { $match: { role: "vendor", isBlocked: { $ne: true }, roleSelectionPending: { $ne: true },
+                        $expr: { $eq: [{ $toString: "$_id" }, "$$vendorId"] } } },
+                    { $set: { vendorIsPremium: premiumExpression() } },
+                    { $lookup: {
+                        from: "menuItems", let: { ownerId: { $toString: "$_id" } },
+                        pipeline: [
+                            { $match: { isAvailable: true, status: { $in: ["pending", "approved"] },
+                                $expr: { $eq: [{ $toString: "$vendorId" }, "$$ownerId"] } } },
+                            { $sort: { createdAt: 1, _id: 1 } }, { $limit: 3 }, { $project: { _id: 1 } }
+                        ], as: "freeSlots"
+                    } },
+                    { $project: { name: 1, image: 1, vendorIsPremium: 1, freeSlots: 1 } },
+                    { $limit: 1 }
+                ], as: "vendor"
+            } },
             { $unwind: "$vendor" },
-
-            {
-                $set: {
-                    vendorId: { $toString: "$vendor._id" },
-                    vendorName: "$vendor.name",
-                    vendorImage: { $ifNull: ["$vendor.image", null] },
-                },
-            },
+            { $match: { $expr: { $or: [
+                "$vendor.vendorIsPremium", { $in: ["$_id", "$vendor.freeSlots._id"] }
+            ] } } },
+            { $set: {
+                vendorId: { $toString: "$vendor._id" }, vendorName: "$vendor.name",
+                vendorImage: { $ifNull: ["$vendor.image", null] }, vendorIsPremium: "$vendor.vendorIsPremium"
+            } }
         ];
     }
 
@@ -935,6 +906,7 @@ async function startServer() {
         vendorId: 1,
         vendorName: 1,
         vendorImage: 1,
+        vendorIsPremium: 1,
         createdAt: 1,
     };
 
@@ -966,7 +938,7 @@ async function startServer() {
                         },
                     },
                     ...activeVendorStages(),
-                    { $sort: { createdAt: -1, _id: -1 } },
+                    { $sort: { vendorIsPremium: -1, createdAt: -1, _id: -1 } },
                     { $limit: 6 },
                     { $project: publicMenuProjection },
                 ])
@@ -998,78 +970,14 @@ async function startServer() {
                 });
             }
 
-            const item = await menuItemsCollection.findOne(
-                {
-                    _id: new ObjectId(id),
-                    status: "approved",
-                    isAvailable: true,
-                },
-                {
-                    projection: {
-                        itemName: 1,
-                        description: 1,
-                        category: 1,
-                        price: 1,
-                        location: 1,
-                        images: 1,
-                        vendorId: 1,
-                    },
-                }
-            );
+            const [item] = await menuItemsCollection.aggregate([
+                { $match: { _id: new ObjectId(id), status: "approved", isAvailable: true } },
+                ...activeVendorStages(),
+                { $project: publicMenuProjection },
+            ]).toArray();
+            if (!item) return res.status(404).json({ success: false, message: "This item or its vendor is unavailable." });
+            return res.json({ success: true, data: item });
 
-            if (!item) {
-                return res.status(404).json({
-                    success: false,
-                    message: "This menu item is unavailable or does not exist.",
-                });
-            }
-
-            const vendorId = String(item.vendorId ?? "");
-
-            if (!vendorId) {
-                return res.status(404).json({
-                    success: false,
-                    message: "This item's vendor is unavailable.",
-                });
-            }
-
-            const possibleIds = [vendorId];
-
-            if (/^[a-fA-F0-9]{24}$/.test(vendorId)) {
-                possibleIds.push(new ObjectId(vendorId));
-            }
-
-            const vendor = await usersCollection.findOne(
-                {
-                    _id: { $in: possibleIds },
-                    role: "vendor",
-                    isBlocked: { $ne: true },
-                    roleSelectionPending: { $ne: true },
-                },
-                {
-                    projection: {
-                        name: 1,
-                        image: 1,
-                    },
-                }
-            );
-
-            if (!vendor) {
-                return res.status(404).json({
-                    success: false,
-                    message: "This item's vendor is unavailable.",
-                });
-            }
-
-            return res.status(200).json({
-                success: true,
-                data: {
-                    ...item,
-                    vendorId: String(vendor._id),
-                    vendorName: vendor.name,
-                    vendorImage: vendor.image ?? null,
-                },
-            });
         } catch (error) {
             next(error);
         }
@@ -1771,13 +1679,7 @@ async function startServer() {
                             acceptedOrders,
                         },
 
-                        // Stage 1: no paid subscription activation exists yet.
-                        // Replace with verified subscription lookup in the payment stage.
-                        subscription: {
-                            plan: "free",
-                            activeItemLimit: 3,
-                            checkoutEnabled: false,
-                        },
+                        subscription: billing.subscriptionView(req.account),
                     },
                 });
             } catch (error) {
@@ -1978,8 +1880,8 @@ async function startServer() {
                     isAvailable: true,
                 };
 
-                // Stage 2: all vendors remain Free until verified payments launch.
-                const activeItemLimit = 3;
+                // Read the verified, unexpired subscription.
+                const activeItemLimit = await billing.limitFor(req.account);
 
                 // Early check avoids an unnecessary image upload.
                 // The authoritative check is repeated inside the transaction.
@@ -2117,7 +2019,7 @@ async function startServer() {
                             { session: databaseSession }
                         );
 
-                        if (activeCount >= activeItemLimit) {
+                        if (activeCount >= await billing.limitFor(req.account, databaseSession)) {
                             throw menuCreateError(
                                 409,
                                 "Your Free plan allows up to 3 active items."
@@ -2434,8 +2336,7 @@ async function startServer() {
     }
 
     async function ensureMenuSlotAvailable(account, itemId, session) {
-        // Premium entitlement will be connected after verified payment integration.
-        const activeItemLimit = 3;
+        const activeItemLimit = await billing.limitFor(account, session);
 
         const otherActiveItems = await menuItemsCollection.countDocuments(
             {
@@ -2984,6 +2885,8 @@ async function startServer() {
         }
     );
 
+    billing.mountRoutes(app, requireAccount, requireRole);
+
     // ==================================================
     // Unknown routes
     // ==================================================
@@ -3030,6 +2933,7 @@ async function startServer() {
     // Listen only after initialization completes
     // ==================================================
 
+    const stopBilling = billing.start();
     const server = app.listen(port, () => {
         console.log(`PizzaHub server: http://localhost:${port}`);
     });
@@ -3037,6 +2941,7 @@ async function startServer() {
     server.on("error", async (error) => {
         console.error("Server could not start:", error.code);
 
+        stopBilling();
         await client.close();
         process.exit(1);
     });
