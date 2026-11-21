@@ -44,3 +44,26 @@ test('auth responses disable caching and 401/403 are distinguished', () => {
   assert.ok(server.includes('res.status(401).json('));
   assert.ok(server.includes('res.status(403).json('));
 });
+
+test('admin dashboard endpoints are role-protected and expose required management operations', () => {
+  for (const fragment of [
+    'app.get("/api/admin/overview"',
+    'app.get("/api/admin/users"',
+    'app.patch("/api/admin/users/:id/block"',
+    'app.get("/api/admin/menu"',
+    'app.patch("/api/admin/menu/:id"',
+    'app.delete("/api/admin/menu/:id"',
+    'app.get("/api/admin/transactions"',
+    'filter.$or = [{ itemName:',
+    'subscriptionPlan:',
+  ]) assert.ok(billing.includes(fragment), fragment);
+  assert.match(billing, /app\.get\("\/api\/admin\/transactions"[\s\S]*?\n    \}\)\);/);
+  assert.doesNotMatch(billing, /app\.(?:patch|post|put|delete)\("\/api\/admin\/transactions/);
+});
+
+test('admin dashboard UI is present and guarded by the admin role', () => {
+  const adminPage = readFileSync(new URL('../pizzahub/components/admin/AdminDashboard.tsx', import.meta.url), 'utf8');
+  const adminLayout = readFileSync(new URL('../pizzahub/app/(main)/dashboard/admin/layout.tsx', import.meta.url), 'utf8');
+  assert.ok(adminLayout.includes('<RequireAuth role="admin">'));
+  for (const fragment of ['Total registered users', 'Total vendors', 'Total customers', 'Total menu items', 'Pending menu items', 'Total transactions', 'Block', 'Unblock', 'Approve', 'Reject', 'Deactivate', 'Delete', 'Payment records are read-only']) assert.ok(adminPage.includes(fragment), fragment);
+});

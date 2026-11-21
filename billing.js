@@ -371,7 +371,100 @@ export async function createBilling({ client, db, clientUrl, stripeClient }) {
   }
 
   function mountRoutes(app, requireAccount, requireRole) {
+    const admin = [requireAccount, requireRole("admin")];
     const vendor = [requireAccount, requireRole("vendor")];
+
+    // Admin overview: aggregate counts from authoritative collections.
+    app.get("/api/admin/overview", ...admin, route(async (req, res) => {
+      const [totalUsers, totalVendors, totalCustomers, totalMenuItems, pendingMenuItems, totalTransactions] = await Promise.all([
+        users.countDocuments({}),
+        users.countDocuments({ role: "vendor" }),
+        users.countDocuments({ role: "customer" }),
+        menu.countDocuments({}),
+        menu.countDocuments({ status: "pending" }),
+        transactions.countDocuments({}),
+      ]);
+      res.set("Cache-Control", "no-store");
+      res.json({ success: true, data: { totalUsers, totalVendors, totalCustomers, totalMenuItems, pendingMenuItems, totalTransactions } });
+    }));
+
+    // Admin user management. Search and filters are bounded and server-side.
+    app.get("/api/admin/users", ...admin, route(async (req, res) => {
+      const search = typeof req.query.search === "string" ? req.query.search.trim().slice(0, 100) : "";
+      const role = typeof req.query.role === "string" ? req.query.role : "all";
+      if (!(["all", "admin", "vendor", "customer"].includes(role))) throw failure(400, "Invalid role filter.");
+      const filter = {};
+      if (role !== "all") filter.role = role;
+      if (search) {
+        const escaped = search.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+        filter.$or = [{ name: { $regex: escaped, $options: "i" } }, { email: { $regex: escaped, $options: "i" } }];
+      }
+      const results = await users.find(filter, { projection: { name: 1, email: 1, role: 1, isBlocked: 1, createdAt: 1 } }).sort({ createdAt: -1 }).limit(200).toArray();
+      res.set("Cache-Control", "no-store");
+      res.json({ success: true, data: results.map((u) => ({ id: String(u._id), name: u.name ?? "", email: u.email ?? "", role: u.role, isBlocked: u.isBlocked === true, createdAt: u.createdAt ?? null })) });
+    }));
+
+    app.patch("/api/admin/users/:id/block", ...admin, route(async (req, res) => {
+      const id = req.params.id;
+      if (typeof id !== "string" || id.length < 1 || id.length > 200 || !["block", "unblock"].includes(req.body?.action) || Object.keys(req.body ?? {}).some((key) => key !== "action")) throw failure(400, "Invalid user block request.");
+      const candidates = /^[a-fA-F0-9]{24}$/.test(id) ? [id, new ObjectId(id)] : [id];
+      const target = await users.findOne({ _id: { $in: candidates } }, { projection: { role: 1 } });
+      if (!target) throw failure(404, "User not found.");
+      if (String(target._id) === String(req.account._id)) throw failure(403, "You cannot block your own admin account.");
+      if (target.role === "admin") throw failure(403, "Admin accounts cannot be blocked through this endpoint.");
+      const blocked = req.body.action === "block";
+      await users.updateOne({ _id: target._id }, { $set: { isBlocked: blocked, updatedAt: new Date() } });
+      res.json({ success: true, data: { id, isBlocked: blocked } });
+    }));
+
+    // Admin menu moderation. Public browse continues to expose only approved + available items.
+    app.get("/api/admin/menu", ...admin, route(async (req, res) => {
+      const status = typeof req.query.status === "string" ? req.query.status : "all";
+      const search = typeof req.query.search === "string" ? req.query.search.trim().slice(0, 100) : "";
+      if (!["all", "pending", "approved", "rejected"].includes(status)) throw failure(400, "Invalid menu status filter.");
+      const filter = {};
+      if (status !== "all") filter.status = status;
+      if (search) {
+        const escaped = search.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+        filter.$or = [{ itemName: { $regex: escaped, $options: "i" } }, { vendorName: { $regex: escaped, $options: "i" } }];
+      }
+      const items = await menu.find(filter).sort({ createdAt: -1 }).limit(250).toArray();
+      res.set("Cache-Control", "no-store");
+      res.json({ success: true, data: items.map((item) => ({ id: String(item._id), name: item.itemName ?? item.name ?? "", vendorName: item.vendorName ?? "", vendorId: String(item.vendorId ?? ""), category: item.category ?? "", price: item.price ?? null, status: item.status ?? "pending", isAvailable: item.isAvailable === true, createdAt: item.createdAt ?? null })) });
+    }));
+
+    app.patch("/api/admin/menu/:id", ...admin, route(async (req, res) => {
+      const { status, isAvailable } = req.body ?? {};
+      if (Object.keys(req.body ?? {}).some((key) => !["status", "isAvailable"].includes(key)) || (status !== undefined && !["pending", "approved", "rejected"].includes(status)) || (isAvailable !== undefined && typeof isAvailable !== "boolean") || (status === undefined && isAvailable === undefined)) throw failure(400, "Invalid menu moderation request.");
+      if (!/^[a-fA-F0-9]{24}$/.test(req.params.id)) throw failure(400, "Invalid menu item ID.");
+      const update = { updatedAt: new Date() };
+      if (status !== undefined) update.status = status;
+      if (isAvailable !== undefined) update.isAvailable = isAvailable;
+      if (status === "rejected") update.isAvailable = false;
+      const result = await menu.updateOne({ _id: new ObjectId(req.params.id) }, { $set: update });
+      if (!result.matchedCount) throw failure(404, "Menu item not found.");
+      res.json({ success: true, message: "Menu item updated." });
+    }));
+
+    app.delete("/api/admin/menu/:id", ...admin, route(async (req, res) => {
+      if (!/^[a-fA-F0-9]{24}$/.test(req.params.id)) throw failure(400, "Invalid menu item ID.");
+      const result = await menu.deleteOne({ _id: new ObjectId(req.params.id) });
+      if (!result.deletedCount) throw failure(404, "Menu item not found.");
+      res.json({ success: true, message: "Menu item deleted." });
+    }));
+
+    // Transactions are deliberately read-only: no admin mutation endpoint exists.
+    app.get("/api/admin/transactions", ...admin, route(async (req, res) => {
+      const rows = await transactions.aggregate([
+        { $sort: { paidAt: -1, createdAt: -1 } }, { $limit: 300 },
+        { $addFields: { vendorObjectId: { $convert: { input: "$vendorId", to: "objectId", onError: null, onNull: null } } } },
+        { $lookup: { from: "users", localField: "vendorObjectId", foreignField: "_id", as: "vendor" } },
+        { $unwind: { path: "$vendor", preserveNullAndEmptyArrays: true } },
+        { $project: { _id: 1, vendorId: 1, vendorName: { $ifNull: ["$vendor.name", "Unknown vendor"] }, vendorEmail: { $ifNull: ["$vendor.email", ""] }, subscriptionPlan: { $cond: [{ $and: [{ $eq: ["$vendor.billing.verified", true] }, { $in: ["$vendor.billing.status", ["active", "past_due"]] }, { $gt: ["$vendor.billing.paidUntil", "$$NOW"] }] }, "premium", "free"] }, amountMinor: 1, currency: 1, status: 1, paidAt: 1, createdAt: 1, periodEnd: 1, subscriptionId: 1 } },
+      ]).toArray();
+      res.set("Cache-Control", "no-store");
+      res.json({ success: true, data: rows });
+    }));
     app.get("/api/vendor/subscription", ...vendor, route(async (req, res) => {
       const history = await transactions.find({ vendorId: String(req.account._id) }, {
         projection: { _id: 1, amountMinor: 1, currency: 1, paidAt: 1, periodEnd: 1, status: 1 },
