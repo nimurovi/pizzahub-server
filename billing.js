@@ -457,6 +457,96 @@ export async function createBilling({ client, db, clientUrl, stripeClient }) {
       res.json({ success: true, message: "Cancellation requested. Paid access lasts until the end of your paid period. Refresh shortly for confirmation." });
     }));
   }
+  async function recoverPendingCheckouts() {
+  if (!stripe) return;
+
+  const pending = await attempts.find({
+    sessionId: { $type: "string" },
+    subscriptionId: { $exists: false },
+    recoveryClosed: { $ne: true },
+    $or: [
+      { nextRecoveryAt: { $exists: false } },
+      { nextRecoveryAt: { $lte: new Date() } },
+    ],
+  })
+    .sort({ nextRecoveryAt: 1, createdAt: 1 })
+    .limit(25)
+    .toArray();
+
+  for (const attempt of pending) {
+    try {
+      // Schedule another check if this attempt is still pending
+      // or Stripe is temporarily unreachable.
+      await attempts.updateOne(
+        { _id: attempt._id },
+        {
+          $set: {
+            nextRecoveryAt: new Date(Date.now() + 120000),
+          },
+        }
+      );
+
+      await withLock(attempt.vendorId, async (guard) => {
+        const current = await attempts.findOne({
+          _id: attempt._id,
+        });
+
+        // A webhook might already have processed this checkout.
+        if (!current || current.subscriptionId) return;
+
+        const checkout = await stripe.checkout.sessions.retrieve(
+          current.sessionId
+        );
+
+        if (
+          checkout.mode !== "subscription" ||
+          checkout.livemode !== liveMode ||
+          checkout.client_reference_id !== current.vendorId ||
+          checkout.metadata?.pizzahubVendorId !== current.vendorId ||
+          checkout.metadata?.pizzahubAttemptId !== current._id
+        ) {
+          throw new Error("Checkout does not match its recorded vendor.");
+        }
+
+        if (checkout.status === "expired") {
+          await attempts.updateOne(
+            { _id: current._id },
+            { $set: { recoveryClosed: true } }
+          );
+          return;
+        }
+
+        if (checkout.status !== "complete") return;
+
+        const subscriptionId = objectId(checkout.subscription);
+        if (!subscriptionId) {
+          throw new Error("Completed checkout has no subscription.");
+        }
+
+        // Do not activate Premium just because checkout is complete.
+        // This function verifies the price, invoice, PaymentIntent,
+        // vendor ownership, and paid period before granting access.
+        await syncSubscription(
+          subscriptionId,
+          guard,
+          null,
+          objectId(checkout.invoice) ?? null
+        );
+
+        console.info("Checkout recovery completed:", {
+          attemptId: current._id,
+          subscriptionId,
+        });
+      });
+    } catch (error) {
+      console.error("Checkout recovery will retry:", {
+        attemptId: attempt._id,
+        name: error?.name,
+        message: error?.message,
+      });
+    }
+  }
+}
 
   let running = false;
   async function reconcile() {
@@ -474,6 +564,7 @@ export async function createBilling({ client, db, clientUrl, stripeClient }) {
         });
       }
       if (!stripe) return;
+      await recoverPendingCheckouts();
       const due = users.find({ "billing.verified": true, "billing.nextReconcileAt": { $lte: new Date() } })
         .sort({ "billing.nextReconcileAt": 1 }).limit(25);
       for await (const user of due) {

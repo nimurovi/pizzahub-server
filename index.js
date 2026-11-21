@@ -10,7 +10,8 @@ import multer from "multer";
 import sharp from "sharp";
 import { createBilling } from "./billing.js";
 import { premiumExpression } from "./billing-policy.js";
-
+import { jwt } from "better-auth/plugins";
+import { createRemoteJWKSet, jwtVerify } from "jose";
 // ==================================================
 // Environment configuration
 // ==================================================
@@ -227,7 +228,29 @@ async function startServer() {
         baseURL: process.env.BETTER_AUTH_URL,
         secret: process.env.BETTER_AUTH_SECRET,
         trustedOrigins: [clientUrl],
+        plugins: [
+            jwt({
+                disableSettingJwtHeader: true,
 
+                jwks: {
+                    keyPairConfig: {
+                        alg: "EdDSA",
+                        crv: "Ed25519",
+                    },
+                },
+
+                jwt: {
+                    issuer: process.env.BETTER_AUTH_URL,
+                    audience: "pizzahub-api",
+                    expirationTime: "5m",
+
+                    // Do not include passwords, billing data, or client-supplied roles.
+                    definePayload: ({ user }) => ({
+                        sub: user.id,
+                    }),
+                },
+            }),
+        ],
         socialProviders: {
             google: {
                 clientId: process.env.GOOGLE_CLIENT_ID,
@@ -372,6 +395,11 @@ async function startServer() {
     });
 
     // Better Auth must come before express.json().
+    // Authentication responses must not be stored by shared or browser caches.
+    app.use(/^\/api\/auth(?:\/.*)?$/, (req, res, next) => {
+        res.set("Cache-Control", "no-store");
+        next();
+    });
     app.all(/^\/api\/auth(?:\/.*)?$/, toNodeHandler(auth));
 
     billing.mountWebhook(app);
@@ -381,47 +409,135 @@ async function startServer() {
     // Authentication and authorization middleware
     // ==================================================
 
+    const jwtIssuer = process.env.BETTER_AUTH_URL;
+    const jwtAudience = "pizzahub-api";
+
+    const jwtKeys = createRemoteJWKSet(
+        new URL(`${jwtIssuer.replace(/\/+$/, "")}/api/auth/jwks`)
+    );
+
+    const invalidJwtCodes = new Set([
+        "ERR_JWT_EXPIRED",
+        "ERR_JWT_CLAIM_VALIDATION_FAILED",
+        "ERR_JWT_INVALID",
+        "ERR_JWS_INVALID",
+        "ERR_JWS_SIGNATURE_VERIFICATION_FAILED",
+        "ERR_JOSE_ALG_NOT_ALLOWED",
+        "ERR_JOSE_NOT_SUPPORTED",
+        "ERR_JWKS_NO_MATCHING_KEY",
+    ]);
+
     async function requireAccount(req, res, next) {
+        // Avoid repeating verification when both the API guard
+        // and the individual route apply this middleware.
+        if (req.jwtVerified === true && req.account) {
+            return next();
+        }
+
+        res.set("Cache-Control", "no-store");
+
+        const unauthorized = (message) =>
+            res.status(401).json({
+                success: false,
+                message,
+            });
+
+        const authorization = req.get("authorization");
+        const match =
+            typeof authorization === "string"
+                ? /^Bearer ([^\s]+)$/i.exec(authorization)
+                : null;
+
+        if (!match || match[1].length > 8192) {
+            return unauthorized("A Bearer JWT is required. Please sign in.");
+        }
+
+        let payload;
+
         try {
+            const verified = await jwtVerify(match[1], jwtKeys, {
+                algorithms: ["EdDSA"],
+                issuer: jwtIssuer,
+                audience: jwtAudience,
+                requiredClaims: ["sub", "iat", "exp"],
+                maxTokenAge: "5m",
+                clockTolerance: 5,
+            });
+
+            payload = verified.payload;
+        } catch (error) {
+            if (invalidJwtCodes.has(error?.code)) {
+                return unauthorized("Your access token is invalid or expired.");
+            }
+
+            // Key-server failures are service errors, not bad credentials.
+            console.error("JWT verification unavailable:", {
+                name: error?.name,
+                code: error?.code,
+            });
+
+            return res.status(503).json({
+                success: false,
+                message: "Authentication is temporarily unavailable. Try again.",
+            });
+        }
+
+        if (
+            typeof payload.sub !== "string" ||
+            payload.sub.length === 0 ||
+            payload.sub.length > 200
+        ) {
+            return unauthorized("Invalid token subject.");
+        }
+
+        try {
+            // JWT is mandatory, and its owner must still be logged in.
+            // Read current session state rather than cached cookie data.
             const session = await auth.api.getSession({
                 headers: fromNodeHeaders(req.headers),
+                query: {
+                    disableCookieCache: true,
+                },
             });
 
-            if (!session?.user) {
-                return res.status(401).json({
-                    success: false,
-                    message: "Please sign in first.",
-                });
+            if (!session?.user || session.user.id !== payload.sub) {
+                return unauthorized("Your login session has ended. Please sign in.");
             }
 
-            const userId = session.user.id;
+            const possibleIds = [payload.sub];
 
-            const databaseId = ObjectId.isValid(userId)
-                ? new ObjectId(userId)
-                : userId;
+            if (/^[a-fA-F0-9]{24}$/.test(payload.sub)) {
+                possibleIds.push(new ObjectId(payload.sub));
+            }
 
-            const user = await usersCollection.findOne({
-                _id: databaseId,
+            const account = await usersCollection.findOne({
+                _id: { $in: possibleIds },
             });
 
-            if (!user) {
-                return res.status(401).json({
-                    success: false,
-                    message: "Account not found. Please sign in again.",
-                });
+            if (!account) {
+                return unauthorized("Account not found. Please sign in again.");
             }
 
-            if (user.isBlocked === true) {
+            if (account.isBlocked === true) {
                 return res.status(403).json({
                     success: false,
                     message: "Your account is blocked.",
                 });
             }
 
-            req.account = user;
-            next();
+            if (!["admin", "vendor", "customer"].includes(account.role)) {
+                return res.status(403).json({
+                    success: false,
+                    message: "Your account does not have a permitted role.",
+                });
+            }
+
+            req.account = account;
+            req.jwtVerified = true;
+
+            return next();
         } catch (error) {
-            next(error);
+            return next(error);
         }
     }
 
@@ -478,6 +594,42 @@ async function startServer() {
         next();
     }
 
+
+    // Only these application API endpoints are public.
+    const publicApiReads = new Set([
+        "/menu",
+        "/menu/featured",
+    ]);
+
+    app.use("/api", (req, res, next) => {
+        // Same-origin browser mutations only. JWT checks remain mandatory even
+        // if a caller sends a forged or absent Origin header.
+        if (!["GET", "HEAD", "OPTIONS"].includes(req.method)) {
+            const origin = req.get("origin");
+            if (origin && origin !== new URL(clientUrl).origin) {
+                return res.status(403).json({
+                    success: false,
+                    message: "Request origin is not allowed.",
+                });
+            }
+        }
+
+        const isPublicRead =
+            ["GET", "HEAD"].includes(req.method) &&
+            publicApiReads.has(req.path);
+
+        if (isPublicRead) {
+            return next();
+        }
+
+        return requireAccount(req, res, next);
+    });
+
+    // Apply role checks to every route under these prefixes.
+    app.use("/api/vendor", requireRole("vendor"));
+    app.use("/api/admin", requireRole("admin"));
+    app.use("/api/customer", requireRole("customer"));
+
     // ==================================================
     // Onboarding
     // ==================================================
@@ -515,7 +667,23 @@ async function startServer() {
                     });
                 }
 
-                const role = req.body?.role;
+                // Accept only the one field used by onboarding. Neither an
+                // account identifier nor an admin role can come from the client.
+                const body = req.body;
+                if (
+                    !body ||
+                    typeof body !== "object" ||
+                    Array.isArray(body) ||
+                    Object.keys(body).length !== 1 ||
+                    !Object.prototype.hasOwnProperty.call(body, "role")
+                ) {
+                    return res.status(400).json({
+                        success: false,
+                        message: "Provide only the account role.",
+                    });
+                }
+
+                const role = body.role;
 
                 if (role !== "customer" && role !== "vendor") {
                     return res.status(400).json({
@@ -865,33 +1033,53 @@ async function startServer() {
 
     function activeVendorStages() {
         return [
-            { $lookup: {
-                from: "users",
-                let: { vendorId: { $convert: { input: "$vendorId", to: "string", onError: null, onNull: null } } },
-                pipeline: [
-                    { $match: { role: "vendor", isBlocked: { $ne: true }, roleSelectionPending: { $ne: true },
-                        $expr: { $eq: [{ $toString: "$_id" }, "$$vendorId"] } } },
-                    { $set: { vendorIsPremium: premiumExpression() } },
-                    { $lookup: {
-                        from: "menuItems", let: { ownerId: { $toString: "$_id" } },
-                        pipeline: [
-                            { $match: { isAvailable: true, status: { $in: ["pending", "approved"] },
-                                $expr: { $eq: [{ $toString: "$vendorId" }, "$$ownerId"] } } },
-                            { $sort: { createdAt: 1, _id: 1 } }, { $limit: 3 }, { $project: { _id: 1 } }
-                        ], as: "freeSlots"
-                    } },
-                    { $project: { name: 1, image: 1, vendorIsPremium: 1, freeSlots: 1 } },
-                    { $limit: 1 }
-                ], as: "vendor"
-            } },
+            {
+                $lookup: {
+                    from: "users",
+                    let: { vendorId: { $convert: { input: "$vendorId", to: "string", onError: null, onNull: null } } },
+                    pipeline: [
+                        {
+                            $match: {
+                                role: "vendor", isBlocked: { $ne: true }, roleSelectionPending: { $ne: true },
+                                $expr: { $eq: [{ $toString: "$_id" }, "$$vendorId"] }
+                            }
+                        },
+                        { $set: { vendorIsPremium: premiumExpression() } },
+                        {
+                            $lookup: {
+                                from: "menuItems", let: { ownerId: { $toString: "$_id" } },
+                                pipeline: [
+                                    {
+                                        $match: {
+                                            isAvailable: true, status: { $in: ["pending", "approved"] },
+                                            $expr: { $eq: [{ $toString: "$vendorId" }, "$$ownerId"] }
+                                        }
+                                    },
+                                    { $sort: { createdAt: 1, _id: 1 } }, { $limit: 3 }, { $project: { _id: 1 } }
+                                ], as: "freeSlots"
+                            }
+                        },
+                        { $project: { name: 1, image: 1, vendorIsPremium: 1, freeSlots: 1 } },
+                        { $limit: 1 }
+                    ], as: "vendor"
+                }
+            },
             { $unwind: "$vendor" },
-            { $match: { $expr: { $or: [
-                "$vendor.vendorIsPremium", { $in: ["$_id", "$vendor.freeSlots._id"] }
-            ] } } },
-            { $set: {
-                vendorId: { $toString: "$vendor._id" }, vendorName: "$vendor.name",
-                vendorImage: { $ifNull: ["$vendor.image", null] }, vendorIsPremium: "$vendor.vendorIsPremium"
-            } }
+            {
+                $match: {
+                    $expr: {
+                        $or: [
+                            "$vendor.vendorIsPremium", { $in: ["$_id", "$vendor.freeSlots._id"] }
+                        ]
+                    }
+                }
+            },
+            {
+                $set: {
+                    vendorId: { $toString: "$vendor._id" }, vendorName: "$vendor.name",
+                    vendorImage: { $ifNull: ["$vendor.image", null] }, vendorIsPremium: "$vendor.vendorIsPremium"
+                }
+            }
         ];
     }
 
@@ -1555,6 +1743,22 @@ async function startServer() {
                     return res.status(403).json({
                         success: false,
                         message: "This request is not allowed.",
+                    });
+                }
+
+                // Cancellation is an action without an editable payload.
+                // Reject an unexpected JSON body rather than silently accepting
+                // user-controlled account, owner or order-status fields.
+                if (
+                    req.body !== undefined &&
+                    (typeof req.body !== "object" ||
+                        req.body === null ||
+                        Array.isArray(req.body) ||
+                        Object.keys(req.body).length !== 0)
+                ) {
+                    return res.status(400).json({
+                        success: false,
+                        message: "Order cancellation does not accept request fields.",
                     });
                 }
 
