@@ -94,6 +94,16 @@ async function startServer() {
             },
         }
     );
+    await ordersCollection.createIndex(
+        {
+            vendorId: 1,
+            createdAt: -1,
+            _id: -1,
+        },
+        {
+            name: "vendor_orders_newest",
+        }
+    );
 
     await menuItemsCollection.createIndex({
         status: 1,
@@ -2735,6 +2745,245 @@ async function startServer() {
             }
         }
     );
+
+    // ---------- Vendor customer orders ----------
+
+    // List orders belonging to the authenticated vendor.
+    app.get(
+        "/api/vendor/orders",
+        requireAccount,
+        requireRole("vendor"),
+        async (req, res, next) => {
+            try {
+                res.set("Cache-Control", "no-store");
+
+                const pageText = req.query.page ?? "1";
+
+                if (
+                    typeof pageText !== "string" ||
+                    !/^[1-9]\d*$/.test(pageText) ||
+                    Number(pageText) > 100_000
+                ) {
+                    return res.status(400).json({
+                        success: false,
+                        message: "Invalid page number.",
+                    });
+                }
+
+                const page = Number(pageText);
+                const pageSize = 10;
+
+                // Order creation stores vendorId as a string.
+                const vendorId = String(req.account._id);
+
+                const [result] = await ordersCollection
+                    .aggregate([
+                        {
+                            $match: { vendorId },
+                        },
+                        {
+                            $facet: {
+                                orders: [
+                                    {
+                                        $sort: {
+                                            createdAt: -1,
+                                            _id: -1,
+                                        },
+                                    },
+                                    { $skip: (page - 1) * pageSize },
+                                    { $limit: pageSize },
+                                    {
+                                        $project: {
+                                            customerName: 1,
+                                            itemId: 1,
+                                            itemName: 1,
+                                            itemImage: 1,
+                                            orderDate: 1,
+                                            deliveryAddress: 1,
+                                            message: 1,
+                                            quantity: 1,
+                                            currency: 1,
+                                            unitPriceMinor: 1,
+                                            totalPriceMinor: 1,
+                                            status: 1,
+                                            createdAt: 1,
+                                            updatedAt: 1,
+                                        },
+                                    },
+                                ],
+                                summary: [
+                                    {
+                                        $group: {
+                                            _id: null,
+                                            total: { $sum: 1 },
+                                            pending: {
+                                                $sum: {
+                                                    $cond: [{ $eq: ["$status", "pending"] }, 1, 0],
+                                                },
+                                            },
+                                            accepted: {
+                                                $sum: {
+                                                    $cond: [{ $eq: ["$status", "accepted"] }, 1, 0],
+                                                },
+                                            },
+                                            rejected: {
+                                                $sum: {
+                                                    $cond: [{ $eq: ["$status", "rejected"] }, 1, 0],
+                                                },
+                                            },
+                                            cancelled: {
+                                                $sum: {
+                                                    $cond: [{ $eq: ["$status", "cancelled"] }, 1, 0],
+                                                },
+                                            },
+                                        },
+                                    },
+                                ],
+                            },
+                        },
+                    ])
+                    .toArray();
+
+                const counts = result?.summary[0];
+
+                const summary = {
+                    total: counts?.total ?? 0,
+                    pending: counts?.pending ?? 0,
+                    accepted: counts?.accepted ?? 0,
+                    rejected: counts?.rejected ?? 0,
+                    cancelled: counts?.cancelled ?? 0,
+                };
+
+                return res.json({
+                    success: true,
+                    data: {
+                        summary,
+                        orders: (result?.orders ?? []).map((order) => ({
+                            ...order,
+                            _id: String(order._id),
+                        })),
+                        pagination: {
+                            page,
+                            pageSize,
+                            total: summary.total,
+                            totalPages: Math.max(
+                                1,
+                                Math.ceil(summary.total / pageSize)
+                            ),
+                        },
+                    },
+                });
+            } catch (error) {
+                next(error);
+            }
+        }
+    );
+
+    // Accept or reject an owned pending order.
+    // Ownership and pending status are checked in the same atomic update.
+    app.patch(
+        "/api/vendor/orders/:id/status",
+        requireAccount,
+        requireRole("vendor"),
+        async (req, res, next) => {
+            try {
+                res.set("Cache-Control", "no-store");
+
+                if (req.get("origin") !== new URL(clientUrl).origin) {
+                    return res.status(403).json({
+                        success: false,
+                        message: "This request is not allowed.",
+                    });
+                }
+
+                if (!req.is("application/json")) {
+                    return res.status(415).json({
+                        success: false,
+                        message: "Send the order status as JSON.",
+                    });
+                }
+
+                if (!/^[a-fA-F0-9]{24}$/.test(req.params.id)) {
+                    return res.status(400).json({
+                        success: false,
+                        message: "Invalid order ID.",
+                    });
+                }
+
+                const body = req.body;
+
+                if (
+                    !body ||
+                    typeof body !== "object" ||
+                    Array.isArray(body) ||
+                    Object.keys(body).length !== 1 ||
+                    !["accepted", "rejected"].includes(body.status)
+                ) {
+                    return res.status(400).json({
+                        success: false,
+                        message: "Provide only a status of accepted or rejected.",
+                    });
+                }
+
+                const ownership = {
+                    _id: new ObjectId(req.params.id),
+                    vendorId: String(req.account._id),
+                };
+
+                const now = new Date();
+
+                const result = await ordersCollection.updateOne(
+                    {
+                        ...ownership,
+                        status: "pending",
+                    },
+                    {
+                        $set: {
+                            status: body.status,
+                            updatedAt: now,
+                            respondedAt: now,
+                        },
+                    }
+                );
+
+                if (result.matchedCount !== 1) {
+                    const existing = await ordersCollection.findOne(
+                        ownership,
+                        { projection: { _id: 1 } }
+                    );
+
+                    if (!existing) {
+                        return res.status(404).json({
+                            success: false,
+                            message: "Order not found.",
+                        });
+                    }
+
+                    return res.status(409).json({
+                        success: false,
+                        message:
+                            "This order is no longer pending. Refresh to see its current status.",
+                    });
+                }
+
+                return res.json({
+                    success: true,
+                    message:
+                        body.status === "accepted"
+                            ? "Order accepted successfully."
+                            : "Order rejected successfully.",
+                    data: {
+                        _id: req.params.id,
+                        status: body.status,
+                        updatedAt: now,
+                    },
+                });
+            } catch (error) {
+                next(error);
+            }
+        }
+    );
+
     // ==================================================
     // Unknown routes
     // ==================================================
