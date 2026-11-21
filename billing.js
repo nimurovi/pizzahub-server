@@ -6,11 +6,18 @@ import { STRIPE_API_VERSION, FREE_LIMIT, PRICE_MINOR, objectId, premiumActive, p
 
 const terminalStatuses = ["canceled", "incomplete_expired"];
 const handledEvents = new Set([
-  "checkout.session.completed", "checkout.session.async_payment_succeeded",
-  "checkout.session.async_payment_failed", "checkout.session.expired",
-  "invoice.paid", "invoice.payment_failed", "invoice.payment_action_required",
-  "customer.subscription.created", "customer.subscription.updated",
-  "customer.subscription.deleted", "customer.subscription.paused",
+  "checkout.session.completed",
+  "checkout.session.async_payment_succeeded",
+  "checkout.session.async_payment_failed",
+  "checkout.session.expired",
+  "invoice.paid",
+  "invoice_payment.paid",
+  "invoice.payment_failed",
+  "invoice.payment_action_required",
+  "customer.subscription.created",
+  "customer.subscription.updated",
+  "customer.subscription.deleted",
+  "customer.subscription.paused",
   "customer.subscription.resumed",
 ]);
 const failure = (status, message) => Object.assign(new Error(message), { httpStatus: status });
@@ -36,8 +43,8 @@ export async function createBilling({ client, db, clientUrl, stripeClient }) {
   if (stripe) {
     const price = await stripe.prices.retrieve(priceId);
     if (!price.active || price.currency !== "usd" || price.unit_amount !== PRICE_MINOR ||
-        price.recurring?.interval !== "month" || price.recurring?.interval_count !== 1 ||
-        price.recurring?.usage_type !== "licensed" || price.billing_scheme !== "per_unit") {
+      price.recurring?.interval !== "month" || price.recurring?.interval_count !== 1 ||
+      price.recurring?.usage_type !== "licensed" || price.billing_scheme !== "per_unit") {
       throw new Error("Stripe Price must be an active USD 10.00 monthly recurring, per-unit licensed price.");
     }
     liveMode = price.livemode;
@@ -87,7 +94,8 @@ export async function createBilling({ client, db, clientUrl, stripeClient }) {
 
   async function trimFreeItems(user, session) {
     if (premiumActive(user.billing)) return;
-    const extra = await menu.find({ ...itemOwner(user._id), isAvailable: true,
+    const extra = await menu.find({
+      ...itemOwner(user._id), isAvailable: true,
       status: { $in: ["pending", "approved"] },
     }, { session, projection: { _id: 1 } }).sort({ createdAt: 1, _id: 1 }).skip(FREE_LIMIT).toArray();
     if (extra.length) await menu.updateMany({ _id: { $in: extra.map((item) => item._id) } }, {
@@ -141,8 +149,10 @@ export async function createBilling({ client, db, clientUrl, stripeClient }) {
     const verified = (await Promise.all(candidates.map(async (candidate) => {
       const saved = await transactions.findOne({ _id: candidate.invoice.id, vendorId, subscriptionId: sub.id });
       if (saved) return candidate;
-      const payments = await stripe.invoicePayments.list({ invoice: candidate.invoice.id, status: "paid", limit: 100,
-        expand: ["data.payment.payment_intent"] });
+      const payments = await stripe.invoicePayments.list({
+        invoice: candidate.invoice.id, status: "paid", limit: 100,
+        expand: ["data.payment.payment_intent"]
+      });
       // Require a successful Stripe PaymentIntent, not a manually marked-paid invoice.
       return payments.data.some((payment) => verifiedInvoicePayment(payment, candidate.invoice, liveMode)) ? candidate : null;
     }))).filter(Boolean);
@@ -154,13 +164,15 @@ export async function createBilling({ client, db, clientUrl, stripeClient }) {
       if (!user) throw failure(404, "Vendor account no longer exists.");
       if (event && await events.findOne({ _id: event.id, processed: true }, { session })) return;
       for (const { invoice, period } of verified) {
-        await transactions.updateOne({ _id: invoice.id }, { $setOnInsert: {
-          vendorId, invoiceId: invoice.id, subscriptionId: sub.id, attemptId,
-          amountMinor: invoice.amount_paid, currency: "USD", status: "paid",
-          paidAt: new Date((invoice.status_transitions?.paid_at ?? invoice.created) * 1000),
-          periodStart: period.start, periodEnd: period.end, livemode: liveMode,
-          createdAt: new Date(),
-        } }, { upsert: true, session });
+        await transactions.updateOne({ _id: invoice.id }, {
+          $setOnInsert: {
+            vendorId, invoiceId: invoice.id, subscriptionId: sub.id, attemptId,
+            amountMinor: invoice.amount_paid, currency: "USD", status: "paid",
+            paidAt: new Date((invoice.status_transitions?.paid_at ?? invoice.created) * 1000),
+            periodStart: period.start, periodEnd: period.end, livemode: liveMode,
+            createdAt: new Date(),
+          }
+        }, { upsert: true, session });
       }
       // Old subscription events may save history, but cannot replace a newer subscription.
       const newer = user.billing?.attemptCreatedAt &&
@@ -191,47 +203,153 @@ export async function createBilling({ client, db, clientUrl, stripeClient }) {
   }
 
   function mountWebhook(app) {
-    // MUST be registered before express.json(). No cookie authentication here.
-    app.post("/api/stripe/webhook", express.raw({ type: "application/json", limit: "1mb" }), async (req, res) => {
-      if (!stripe) return res.status(503).send("Billing is not configured.");
-      let event;
-      try { event = stripe.webhooks.constructEvent(req.body, req.get("stripe-signature"), webhookSecret); }
-      catch { return res.status(400).send("Invalid Stripe webhook signature."); }
-      if (event.livemode !== liveMode) return res.status(400).send("Stripe mode mismatch.");
-      if (!handledEvents.has(event.type)) return res.json({ received: true });
-      try {
-        await events.updateOne({ _id: event.id }, {
-          $setOnInsert: { type: event.type, receivedAt: new Date(), processed: false },
-        }, { upsert: true });
-        if ((await events.findOne({ _id: event.id }))?.processed) return res.json({ received: true });
-        const obj = event.data.object;
-        let subscriptionId;
-        let invoiceId;
-        if (event.type.startsWith("checkout.")) {
-          const checkout = await stripe.checkout.sessions.retrieve(obj.id);
-          subscriptionId = objectId(checkout.subscription);
-          if (!subscriptionId) {
-            await events.updateOne({ _id: event.id }, { $set: { processed: true } });
+    // Register before express.json().
+    app.post(
+      "/api/stripe/webhook",
+      express.raw({ type: "application/json", limit: "1mb" }),
+      async (req, res) => {
+        if (!stripe) {
+          return res.status(503).send("Billing is not configured.");
+        }
+
+        let event;
+
+        try {
+          event = stripe.webhooks.constructEvent(
+            req.body,
+            req.get("stripe-signature"),
+            webhookSecret
+          );
+        } catch {
+          return res.status(400).send("Invalid Stripe webhook signature.");
+        }
+
+        if (event.livemode !== liveMode) {
+          return res.status(400).send("Stripe mode mismatch.");
+        }
+
+        if (!handledEvents.has(event.type)) {
+          return res.json({ received: true, ignored: true });
+        }
+
+        try {
+          await events.updateOne(
+            { _id: event.id },
+            {
+              $setOnInsert: {
+                type: event.type,
+                receivedAt: new Date(),
+                processed: false,
+              },
+            },
+            { upsert: true }
+          );
+
+          const previous = await events.findOne({ _id: event.id });
+
+          if (previous?.processed === true) {
             return res.json({ received: true });
           }
-        } else if (event.type.startsWith("invoice.")) {
-          const invoice = await stripe.invoices.retrieve(obj.id);
-          subscriptionId = objectId(invoice.parent?.subscription_details?.subscription ?? invoice.subscription);
-          invoiceId = invoice.id;
-        } else subscriptionId = obj.id;
-        if (!subscriptionId) return res.json({ received: true });
-        const sub = await stripe.subscriptions.retrieve(subscriptionId);
-        const vendorId = sub.metadata?.pizzahubVendorId;
-        if (vendorId && sub.metadata?.pizzahubAttemptId) {
-          await withLock(vendorId, (guard) => syncSubscription(subscriptionId, guard, event, invoiceId));
+
+          const obj = event.data.object;
+          let subscriptionId;
+          let invoiceId;
+
+          if (event.type.startsWith("checkout.")) {
+            const checkout = await stripe.checkout.sessions.retrieve(obj.id);
+            subscriptionId = objectId(checkout.subscription);
+          } else if (
+            event.type === "invoice_payment.paid" ||
+            event.type.startsWith("invoice.")
+          ) {
+            // Invoice payment events contain an invoice reference.
+            // Invoice events contain the invoice itself.
+            invoiceId =
+              event.type === "invoice_payment.paid"
+                ? objectId(obj.invoice)
+                : obj.id;
+
+            if (!invoiceId) {
+              throw new Error("Invoice ID is missing from the Stripe event.");
+            }
+
+            const invoice = await stripe.invoices.retrieve(invoiceId);
+
+            subscriptionId = objectId(
+              invoice.parent?.subscription_details?.subscription ??
+              invoice.subscription
+            );
+
+            invoiceId = invoice.id;
+          } else if (event.type.startsWith("customer.subscription.")) {
+            subscriptionId = obj.id;
+          }
+
+          // Checkout without a subscription or a non-subscription invoice.
+          if (!subscriptionId) {
+            await events.updateOne(
+              { _id: event.id },
+              {
+                $set: {
+                  processed: true,
+                  ignored: true,
+                  processedAt: new Date(),
+                },
+              }
+            );
+
+            return res.json({ received: true, ignored: true });
+          }
+
+          const sub = await stripe.subscriptions.retrieve(subscriptionId);
+          const vendorId = sub.metadata?.pizzahubVendorId;
+          const attemptId = sub.metadata?.pizzahubAttemptId;
+
+          // Ignore subscriptions belonging to another integration.
+          if (!vendorId || !attemptId) {
+            await events.updateOne(
+              { _id: event.id },
+              {
+                $set: {
+                  processed: true,
+                  ignored: true,
+                  processedAt: new Date(),
+                },
+              }
+            );
+
+            return res.json({ received: true, ignored: true });
+          }
+
+          // Existing synchronizer retrieves and verifies invoice payments,
+          // checks vendor ownership, and saves changes transactionally.
+          await withLock(vendorId, (guard) =>
+            syncSubscription(subscriptionId, guard, event, invoiceId)
+          );
+
+          console.info("Stripe webhook processed:", {
+            eventId: event.id,
+            type: event.type,
+            subscriptionId,
+          });
+
+          return res.json({ received: true });
+        } catch (error) {
+          console.error("Stripe webhook processing failed:", {
+            eventId: event.id,
+            type: event.type,
+            name: error?.name,
+            code: error?.code,
+            message: error?.message,
+          });
+
+          // A failed operation must remain retryable.
+          return res
+            .status(500)
+            .send("Webhook processing failed; retry required.");
         }
-        return res.json({ received: true });
-      } catch (error) {
-        // Non-2xx asks Stripe to retry. Never acknowledge a failed database write.
-        console.error("Stripe webhook processing failed:", event.id, error.name);
-        return res.status(500).send("Webhook processing failed; retry required.");
       }
-    });
+    );
   }
 
   const route = (handler) => async (req, res, next) => {
@@ -246,7 +364,7 @@ export async function createBilling({ client, db, clientUrl, stripeClient }) {
     if (!enabled) return res.status(503).json({ success: false, message: "Payments are not configured yet." });
     if (req.get("origin") !== new URL(clientUrl).origin) return res.status(403).json({ success: false, message: "Request not allowed." });
     if (!req.is("application/json") || !req.body || Array.isArray(req.body) ||
-        typeof req.body !== "object" || Object.keys(req.body).length !== 0) {
+      typeof req.body !== "object" || Object.keys(req.body).length !== 0) {
       return res.status(400).json({ success: false, message: "Send an empty JSON object. Account and pricing are selected by the server." });
     }
     next();
