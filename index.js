@@ -32,6 +32,35 @@ if (!mongoUri || !clientUrl) {
 // ==================================================
 
 const app = express();
+let initializationPromise;
+
+app.use((req, res, next) => {
+    if (!initializationPromise) {
+        return res.status(503).json({
+            success: false,
+            message: "Server is initializing.",
+        });
+    }
+
+    initializationPromise.then(
+        () => next(),
+        (error) => {
+            console.error("Initialization failed:", error.message);
+
+            res.status(503).json({
+                success: false,
+                message: "Server initialization failed.",
+            });
+        }
+    );
+});
+app.get("/", (req, res) => {
+    res.status(200).json({
+        success: true,
+        message: "PizzaHub Backend API is running",
+        status: "OK",
+    });
+});
 
 app.disable("x-powered-by");
 
@@ -229,6 +258,13 @@ async function startServer() {
         baseURL: process.env.BETTER_AUTH_URL,
         secret: process.env.BETTER_AUTH_SECRET,
         trustedOrigins: [clientUrl],
+        advanced: {
+            defaultCookieAttributes: {
+                sameSite: "none",
+                secure: true,
+                httpOnly: true,
+            },
+        },
         plugins: [
             jwt({
                 disableSettingJwtHeader: true,
@@ -3144,24 +3180,45 @@ async function startServer() {
     // Listen only after initialization completes
     // ==================================================
 
-    const stopBilling = billing.start();
-    const server = app.listen(port, () => {
-        console.log(`PizzaHub server: http://localhost:${port}`);
-    });
-
-    server.on("error", async (error) => {
-        console.error("Server could not start:", error.code);
-
-        stopBilling();
-        await client.close();
-        process.exit(1);
-    });
+    // All middleware and API routes are now initialized.
+    // The local server starts outside this function.
+    return billing;
 }
 
-startServer().catch(async (error) => {
-    console.error("Startup failed:", error.name);
-    console.error("Details:", error.message);
+initializationPromise = startServer();
 
-    await client.close();
-    process.exit(1);
-});
+if (process.env.VERCEL) {
+    // Vercel manages the HTTP server.
+    // The initialization middleware waits for this promise.
+    initializationPromise.catch((error) => {
+        console.error("Vercel startup failed:", error);
+    });
+} else {
+    // Local development
+    initializationPromise
+        .then((billing) => {
+            const stopBilling = billing.start();
+
+            const server = app.listen(port, () => {
+                console.log(
+                    `PizzaHub server: http://localhost:${port}`
+                );
+            });
+
+            server.on("error", async (error) => {
+                console.error("Server error:", error);
+
+                stopBilling();
+                await client.close();
+                process.exit(1);
+            });
+        })
+        .catch(async (error) => {
+            console.error("Startup failed:", error);
+
+            await client.close();
+            process.exit(1);
+        });
+}
+
+export default app;
