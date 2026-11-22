@@ -1,4 +1,5 @@
 import "dotenv/config";
+import { registerReviews, ratingStages } from "./reviews.js";
 import express from "express";
 import cors from "cors";
 import { MongoClient, ObjectId } from "mongodb";
@@ -630,6 +631,8 @@ async function startServer() {
     app.use("/api/admin", requireRole("admin"));
     app.use("/api/customer", requireRole("customer"));
 
+    await registerReviews({ app, db, requireRole, requireOrderCustomer });
+
     // ==================================================
     // Onboarding
     // ==================================================
@@ -1084,6 +1087,7 @@ async function startServer() {
     }
 
     const publicMenuProjection = {
+        averageRating: 1, reviewCount: 1, restaurantAverageRating: 1, restaurantReviewCount: 1,
         _id: 1,
         itemName: 1,
         description: 1,
@@ -1128,6 +1132,7 @@ async function startServer() {
                     ...activeVendorStages(),
                     { $sort: { vendorIsPremium: -1, createdAt: -1, _id: -1 } },
                     { $limit: 6 },
+                    ...ratingStages(),
                     { $project: publicMenuProjection },
                 ])
                 .toArray();
@@ -1161,6 +1166,7 @@ async function startServer() {
             const [item] = await menuItemsCollection.aggregate([
                 { $match: { _id: new ObjectId(id), status: "approved", isAvailable: true } },
                 ...activeVendorStages(),
+                ...ratingStages(),
                 { $project: publicMenuProjection },
             ]).toArray();
             if (!item) return res.status(404).json({ success: false, message: "This item or its vendor is unavailable." });
@@ -1273,6 +1279,7 @@ async function startServer() {
                                 { $sort: sortOptions },
                                 { $skip: (page - 1) * limit },
                                 { $limit: limit },
+                                ...ratingStages(),
                                 { $project: publicMenuProjection },
                             ],
                             totalCount: [{ $count: "total" }],

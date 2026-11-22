@@ -4,8 +4,9 @@
   "description": "",
   "main": "index.js",
   "scripts": {
-    "test": "node --test security-check.test.js",
-    "start": "node index.js"
+    "test": "node --test security-check.test.js reviews.test.js",
+    "start": "node index.js",
+    "test:integration": "node --test reviews.mongo.test.js"
   },
   "keywords": [],
   "author": "",
@@ -22,5 +23,9 @@
     "multer": "^2.5.0",
     "sharp": "^0.35.5",
     "stripe": "18.3.0"
+  },
+  "devDependencies": {
+    "mingo": "^7.2.7",
+    "mongodb-memory-server-core": "^11.4.0"
   }
 }
